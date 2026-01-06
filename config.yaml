@@ -1,0 +1,18 @@
+db_path: "data/app.db"
+
+camera:
+  index: 0
+  warmup_frames: 10
+  width: 640
+  height: 480
+
+biometric:
+  # ORB 匹配分数阈值（0~1）。越高越严格
+  score_threshold: 0.18
+  # 是否尝试人脸裁剪（失败则回退到中心裁剪）
+  use_face_crop: true
+  # ORB 特征点数
+  orb_nfeatures: 800
+
+auth:
+  max_pin_attempts: 1

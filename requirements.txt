@@ -1,0 +1,5 @@
+opencv-python
+numpy
+pyyaml
+opencv-python-headless
+python3-pyscard
