@@ -1,3 +1,4 @@
+# FILE: /home/vboxuser/Desktop/CartePuce/src/auth_flow.py
 from __future__ import annotations
 import os
 import cv2
@@ -19,18 +20,21 @@ class AuthResult:
     bio_score: Optional[float] = None
 
 
-def run_auth_flow(cfg: AppConfig, conn, card_id: str, pin: str) -> AuthResult:
+def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], pin: str) -> AuthResult:
+    """
+    card_id: 实际是 card_uid（从卡内 APDU 读出/初始化）
+    """
     user = get_user_by_card(conn, card_id)
     if not user:
-        log_auth(conn, card_id, None, False, None, "DENY", "unknown_card")
+        log_auth(conn, card_id, card_atr, None, False, None, "DENY", "unknown_card")
         return AuthResult(decision="DENY", reason="unknown_card")
 
     user_id = user["user_id"]
 
-    # 1) PIN 验证
+    # 1) PIN 验证（当前先用 DB 校验；后续可加卡内 PIN2/3 VERIFY）
     pwd_ok = verify_pin(pin, user["pwd_salt"], user["pwd_hash"])
     if not pwd_ok:
-        log_auth(conn, card_id, user_id, False, None, "DENY", "bad_pin")
+        log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", "bad_pin")
         return AuthResult(decision="DENY", reason="bad_pin", user_id=user_id)
 
     # 2) 摄像头抓帧
@@ -44,12 +48,12 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, pin: str) -> AuthResult:
     # 3) 生物模板加载
     template_path = user.get("template_path")
     if not template_path or not os.path.exists(template_path):
-        log_auth(conn, card_id, user_id, True, None, "DENY", "no_biometric_template")
+        log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "no_biometric_template")
         return AuthResult(decision="DENY", reason="no_biometric_template", user_id=user_id)
 
     template = cv2.imread(template_path)
     if template is None:
-        log_auth(conn, card_id, user_id, True, None, "DENY", "template_read_error")
+        log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "template_read_error")
         return AuthResult(decision="DENY", reason="template_read_error", user_id=user_id)
 
     # 4) 比对
@@ -61,8 +65,8 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, pin: str) -> AuthResult:
     )
 
     if score >= cfg.biometric.score_threshold:
-        log_auth(conn, card_id, user_id, True, score, "ALLOW", "ok")
+        log_auth(conn, card_id, card_atr, user_id, True, score, "ALLOW", "ok")
         return AuthResult(decision="ALLOW", reason="ok", user_id=user_id, bio_score=score)
 
-    log_auth(conn, card_id, user_id, True, score, "DENY", "biometric_mismatch")
+    log_auth(conn, card_id, card_atr, user_id, True, score, "DENY", "biometric_mismatch")
     return AuthResult(decision="DENY", reason="biometric_mismatch", user_id=user_id, bio_score=score)

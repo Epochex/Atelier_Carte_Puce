@@ -1,8 +1,8 @@
 from __future__ import annotations
+
 import os
 import sqlite3
-from typing import Optional, Tuple, Any, Dict
-
+from typing import Optional, Any, Dict
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -10,6 +10,7 @@ PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS users (
   user_id      TEXT PRIMARY KEY,
   card_id      TEXT UNIQUE NOT NULL,
+  card_atr     TEXT,
   pwd_salt     BLOB NOT NULL,
   pwd_hash     BLOB NOT NULL,
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS auth_logs (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   ts        TEXT NOT NULL DEFAULT (datetime('now')),
   card_id   TEXT,
+  card_atr  TEXT,
   user_id   TEXT,
   pwd_ok    INTEGER,
   bio_score REAL,
@@ -50,27 +52,51 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, col: str, ddl: str) -> None:
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        conn.commit()
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     conn.commit()
 
+    _ensure_column(conn, "users", "card_atr", "card_atr TEXT")
+    _ensure_column(conn, "auth_logs", "card_atr", "card_atr TEXT")
 
-def upsert_user(conn: sqlite3.Connection, user_id: str, card_id: str, pwd_salt: bytes, pwd_hash: bytes) -> None:
+
+def upsert_user(
+    conn: sqlite3.Connection,
+    user_id: str,
+    card_id: str,
+    pwd_salt: bytes,
+    pwd_hash: bytes,
+    card_atr: Optional[str] = None,
+) -> None:
     conn.execute(
         """
-        INSERT INTO users(user_id, card_id, pwd_salt, pwd_hash)
-        VALUES(?, ?, ?, ?)
+        INSERT INTO users(user_id, card_id, card_atr, pwd_salt, pwd_hash)
+        VALUES(?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
           card_id=excluded.card_id,
+          card_atr=excluded.card_atr,
           pwd_salt=excluded.pwd_salt,
           pwd_hash=excluded.pwd_hash
         """,
-        (user_id, card_id, pwd_salt, pwd_hash),
+        (user_id, card_id, card_atr, pwd_salt, pwd_hash),
     )
     conn.commit()
 
 
-def upsert_biometric(conn: sqlite3.Connection, user_id: str, template_path: str, template_sha256: str, algo: str) -> None:
+def upsert_biometric(
+    conn: sqlite3.Connection,
+    user_id: str,
+    template_path: str,
+    template_sha256: str,
+    algo: str,
+) -> None:
     conn.execute(
         """
         INSERT INTO biometrics(user_id, template_path, template_sha256, algo)
@@ -88,7 +114,7 @@ def upsert_biometric(conn: sqlite3.Connection, user_id: str, template_path: str,
 def get_user_by_card(conn: sqlite3.Connection, card_id: str) -> Optional[Dict[str, Any]]:
     row = conn.execute(
         """
-        SELECT u.user_id, u.card_id, u.pwd_salt, u.pwd_hash,
+        SELECT u.user_id, u.card_id, u.card_atr, u.pwd_salt, u.pwd_hash,
                b.template_path, b.template_sha256, b.algo
         FROM users u
         LEFT JOIN biometrics b ON b.user_id = u.user_id
@@ -99,13 +125,21 @@ def get_user_by_card(conn: sqlite3.Connection, card_id: str) -> Optional[Dict[st
     return dict(row) if row else None
 
 
-def log_auth(conn: sqlite3.Connection, card_id: str, user_id: Optional[str], pwd_ok: bool,
-             bio_score: Optional[float], decision: str, reason: str) -> None:
+def log_auth(
+    conn: sqlite3.Connection,
+    card_id: str,
+    card_atr: Optional[str],
+    user_id: Optional[str],
+    pwd_ok: bool,
+    bio_score: Optional[float],
+    decision: str,
+    reason: str,
+) -> None:
     conn.execute(
         """
-        INSERT INTO auth_logs(card_id, user_id, pwd_ok, bio_score, decision, reason)
-        VALUES(?, ?, ?, ?, ?, ?)
+        INSERT INTO auth_logs(card_id, card_atr, user_id, pwd_ok, bio_score, decision, reason)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
         """,
-        (card_id, user_id, int(pwd_ok), bio_score, decision, reason),
+        (card_id, card_atr, user_id, int(pwd_ok), bio_score, decision, reason),
     )
     conn.commit()
