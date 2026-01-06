@@ -8,6 +8,7 @@ CartePuce/
   ├── camera_test.png
   ├── templates/
     ├── alice.png
+    ├── lin.png
 ├── get_code.py
 ├── requirements.txt
 ├── scripts/
@@ -35,7 +36,6 @@ from pathlib import Path
 root = Path(".").resolve()
 output = root / "code.txt"
 
-# 你不想出现在树里/源码遍历里的目录
 EXCLUDE_DIRS = {
     ".git",
     "__pycache__",
@@ -53,28 +53,13 @@ EXCLUDE_DIRS = {
     "build",
 }
 
-# 你不想出现在输出里的文件（或后缀）
-EXCLUDE_FILES = {
-    "code.txt",  # 避免把输出文件也写回去
-}
-EXCLUDE_SUFFIXES = {
-    ".pyc",
-    ".pyo",
-    ".pyd",
-    ".so",
-    ".dll",
-    ".dylib",
-}
+EXCLUDE_FILES = {"code.txt"}
+EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib"}
+
 
 def should_skip(path: Path) -> bool:
-    """
-    统一过滤逻辑：只要路径任一层目录在 EXCLUDE_DIRS，就跳过。
-    文件名/后缀命中也跳过。
-    """
     rel = path.relative_to(root)
-    parts = set(rel.parts)
-
-    if parts & EXCLUDE_DIRS:
+    if set(rel.parts) & EXCLUDE_DIRS:
         return True
 
     if path.is_file():
@@ -90,7 +75,6 @@ def print_tree(out, root_path: Path) -> None:
     out.write("STRUCTURE:\n")
     out.write(f"{root_path.name}/\n")
 
-    # rglob 结果里混合文件和目录；我们过滤后再输出
     for path in sorted(root_path.rglob("*")):
         if should_skip(path):
             continue
@@ -108,23 +92,18 @@ def print_tree(out, root_path: Path) -> None:
 
 
 with output.open("w", encoding="utf-8") as out:
-    # 1) 目录结构（如果你连这个也不想要，直接注释掉下一行）
     print_tree(out, root)
 
-    # 2) 打印所有 Python 文件源码（同样过滤噪音目录）
     py_files = sorted(p for p in root.rglob("*.py") if p.is_file() and not should_skip(p))
-
     for p in py_files:
         out.write(f"FILE: {p.relative_to(root)}\n\n")
-
         try:
             out.write(p.read_text(encoding="utf-8"))
         except UnicodeDecodeError:
             out.write(p.read_text(encoding="latin-1", errors="replace"))
-
         out.write("\n\n")
 
-print("Filtered directory tree + python code saved to code.txt")
+print("Filtered directory tree + Python code saved to code.txt")
 
 
 FILE: scripts/__init__.py
@@ -133,49 +112,28 @@ FILE: scripts/__init__.py
 
 FILE: scripts/demo_run.py
 
-# FILE: /home/vboxuser/Desktop/CartePuce/scripts/demo_run.py
-import argparse
-
 from src.config import load_config
 from src.db import connect, init_db
-from src.card import open_card, get_card_id
 from src.auth_flow import run_auth_flow
+from src.card import open_card
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    # 保留 simulate 仅用于开发；实际 demo 用真实卡时不要传
-    parser.add_argument("--simulate-card", default=None, help="DEV ONLY: skip real card and use this as card_id")
-    args = parser.parse_args()
-
     cfg = load_config("config.yaml")
     conn = connect(cfg.db_path)
     init_db(conn)
 
-    # Insertion de la carte
-    if args.simulate_card:
-        info = get_card_id(simulate_card=args.simulate_card, timeout_seconds=30)
-        card_uid = info.card_id
-        atr_hex = info.atr_hex
-        print(f"[card] SIMULATED card_uid = {card_uid}")
-        card_user = None
-    else:
-        sess = open_card(timeout_seconds=60)
-        card_uid = sess.ensure_provisioned()
-        atr_hex = sess.atr_hex
-        card_user, tpl_prefix = sess.read_user_mapping()
-        print(f"[card] reader={sess.reader}")
-        print(f"[card] ATR={atr_hex}")
-        print(f"[card] card_uid={card_uid}")
-        if card_user:
-            print(f"[card] card_user_id={card_user} (from card)")
-        # tpl_prefix 仅用于展示/调试，不参与安全判断
+    s = open_card(10)
+    card_uid = s.get_uid_or_none()
+    if not card_uid:
+        print("DENY  user=None bio_score=None reason=unknown_card")
+        return
 
-    # PIN/mot de passe
+    print(f"[card] detected card_id={card_uid} atr={s.atr_hex}")
+
     pin = input("Enter PIN/mot de passe: ").strip()
 
-    # capture -> comparaison -> DB -> autorisation/refus
-    result = run_auth_flow(cfg, conn, card_id=card_uid, card_atr=atr_hex, pin=pin)
+    result = run_auth_flow(cfg, conn, card_id=card_uid, pin=pin)
 
     if result.decision == "ALLOW":
         print(f"ALLOW user={result.user_id} bio_score={result.bio_score:.3f} reason={result.reason}")
@@ -189,7 +147,6 @@ if __name__ == "__main__":
 
 FILE: scripts/enroll_user.py
 
-# FILE: /home/vboxuser/Desktop/CartePuce/scripts/enroll_user.py
 import os
 import argparse
 import cv2
@@ -197,46 +154,28 @@ import cv2
 from src.config import load_config
 from src.db import connect, init_db, upsert_user, upsert_biometric
 from src.security import pbkdf2_hash_pin
-from src.card import open_card, get_card_id
 from src.camera import CameraParams, capture_frame
 from src.bio import sha256_file
+from src.card import open_card
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--user-id", required=True, help="e.g. alice")
-    # 保留 simulate 仅用于开发；实际 demo 用真实卡时不要传这个参数
-    parser.add_argument("--simulate-card", default=None, help="DEV ONLY: skip real card and use this as card_id")
+    parser.add_argument("--user-id", required=True)
     args = parser.parse_args()
 
     cfg = load_config("config.yaml")
     conn = connect(cfg.db_path)
     init_db(conn)
 
-    # 1) 卡：真实卡 -> APDU 初始化/读取 card_uid；模拟 -> 直接用 simulate-card
-    if args.simulate_card:
-        card_info = get_card_id(simulate_card=args.simulate_card, timeout_seconds=30)
-        card_uid = card_info.card_id
-        atr_hex = card_info.atr_hex
-        sess = None
-        print(f"[card] SIMULATED card_uid = {card_uid}")
-    else:
-        sess = open_card(timeout_seconds=60)
-        card_uid = sess.ensure_provisioned()
-        atr_hex = sess.atr_hex
-        print(f"[card] reader={sess.reader}")
-        print(f"[card] ATR={atr_hex}")
-        print(f"[card] card_uid={card_uid}")
-
-    # 2) PIN / mot de passe（当前先用 DB 校验；后续可以再加卡内 PIN2/3 验证）
     pin = input("Enter PIN/mot de passe: ").strip()
     if not pin:
         raise SystemExit("PIN empty")
 
     salt, ph = pbkdf2_hash_pin(pin)
 
-    # 3) 摄像头采集：存本地模板文件（演示用）
     os.makedirs("data/templates", exist_ok=True)
+
     frame = capture_frame(CameraParams(
         index=cfg.camera.index,
         warmup_frames=cfg.camera.warmup_frames,
@@ -246,17 +185,18 @@ def main():
 
     template_path = f"data/templates/{args.user_id}.png"
     cv2.imwrite(template_path, frame)
-    t_sha = sha256_file(template_path)
+    tpl_sha = sha256_file(template_path)
 
-    # 4) 写卡：把 user_id + template hash 前缀写进去（纯演示，非安全依据）
-    if sess is not None:
-        sess.write_user_mapping(user_id=args.user_id, template_sha256_hex=t_sha)
-        print("[card] wrote user mapping into card (user_id + template hash prefix)")
+    s = open_card(10)
+    card_uid, wrote = s.provision_or_load_uid(user_id=args.user_id, tpl_sha256_hex=tpl_sha)
 
-    # 5) 写 DB：用 card_uid 做主关联键
-    upsert_user(conn, args.user_id, card_uid, salt, ph, card_atr=atr_hex)
-    upsert_biometric(conn, args.user_id, template_path, t_sha, algo="ORB+facecrop")
-    print(f"ENROLL OK: user_id={args.user_id}, card_uid={card_uid}, template={template_path}")
+    print(f"[card] card_id={card_uid} atr={s.atr_hex}")
+    print(f"[card] write_app_record={wrote}")
+
+    upsert_user(conn, args.user_id, card_uid, salt, ph)
+    upsert_biometric(conn, args.user_id, template_path, tpl_sha, algo="ORB+facecrop")
+
+    print(f"ENROLL OK: user_id={args.user_id}, template={template_path}")
 
 
 if __name__ == "__main__":
@@ -350,13 +290,13 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
 
     user_id = user["user_id"]
 
-    # 1) PIN 验证（当前先用 DB 校验；后续可加卡内 PIN2/3 VERIFY）
+    # 1) PIN verification
     pwd_ok = verify_pin(pin, user["pwd_salt"], user["pwd_hash"])
     if not pwd_ok:
         log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", "bad_pin")
         return AuthResult(decision="DENY", reason="bad_pin", user_id=user_id)
 
-    # 2) 摄像头抓帧
+    # 2) camera catch
     frame = capture_frame(CameraParams(
         index=cfg.camera.index,
         warmup_frames=cfg.camera.warmup_frames,
@@ -364,7 +304,7 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
         height=cfg.camera.height,
     ))
 
-    # 3) 生物模板加载
+    # 3) biologi model invoke
     template_path = user.get("template_path")
     if not template_path or not os.path.exists(template_path):
         log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "no_biometric_template")
@@ -375,7 +315,7 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
         log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "template_read_error")
         return AuthResult(decision="DENY", reason="template_read_error", user_id=user_id)
 
-    # 4) 比对
+    # compartion
     score = compare_biometric(
         captured_bgr=frame,
         template_bgr=template,
@@ -459,9 +399,8 @@ def orb_score(img1_gray: np.ndarray, img2_gray: np.ndarray, nfeatures: int = 800
     if not matches:
         return 0.0
 
-    # 距离越小越相似；取“好匹配”占比作为分数
     matches = sorted(matches, key=lambda m: m.distance)
-    good = [m for m in matches if m.distance < 50]  # 经验阈值
+    good = [m for m in matches if m.distance < 50]  
     score = len(good) / max(len(matches), 1)
     return float(score)
 
@@ -476,9 +415,11 @@ def compare_biometric(captured_bgr: np.ndarray, template_bgr: np.ndarray,
 FILE: src/camera.py
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
-from dataclasses import dataclass
 
 
 @dataclass
@@ -492,248 +433,230 @@ class CameraParams:
 def capture_frame(params: CameraParams) -> np.ndarray:
     cap = cv2.VideoCapture(params.index)
     if not cap.isOpened():
-        raise RuntimeError(f"无法打开摄像头 index={params.index}（检查 VirtualBox Webcams 是否已勾选）")
+        raise RuntimeError(
+            f"Cannot open camera index={params.index}. "
+            f"Check VirtualBox settings (Devices -> Webcams) and permissions."
+        )
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, params.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, params.height)
 
-    # warmup
     for _ in range(max(1, params.warmup_frames)):
         cap.read()
 
     ok, frame = cap.read()
     cap.release()
-    if not ok or frame is None:
-        raise RuntimeError("摄像头抓帧失败")
 
-    return frame  # BGR
+    if not ok or frame is None:
+        raise RuntimeError("Camera capture failed (no frame returned).")
+
+    return frame
 
 
 FILE: src/card.py
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
 import os
 import time
 import hashlib
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-
-@dataclass
-class CardInfo:
-    card_id: str
-    atr_hex: str
-    reader: str
+from smartcard.CardType import ATRCardType
+from smartcard.CardRequest import CardRequest
+from smartcard.CardConnection import CardConnection
+from smartcard.Exceptions import CardConnectionException
 
 
 class CardError(RuntimeError):
     pass
 
 
-def _bytes_to_hex(bs: bytes) -> str:
-    return " ".join(f"{b:02X}" for b in bs)
+GCM_ATR = [0x3B, 0x02, 0x53, 0x01]
+GCM_ATR_MASK = [0xFF, 0xFF, 0xFF, 0x00]
+GCM_CARD_TYPE = ATRCardType(GCM_ATR, GCM_ATR_MASK)
+
+INS_READ = 0xBE
+INS_UPDATE = 0xDE
+INS_VERIFY = 0x20
+
+ADDR_ISSUER_BASE = 0x01
+ADDR_USER1_BASE = 0x10
+
+APP_WORD_BASE = ADDR_USER1_BASE
+APP_WORD_LEN = 10
+
+MAGIC = b"CP01"
+
+DEFAULT_CSC0 = b"\xAA\xAA\xAA\xAA"
+DEFAULT_CSC1 = b"\x11\x11\x11\x11"
+DEFAULT_CSC2 = b"\x22\x22\x22\x22"
+
+VERIFY_TARGET_CSC0 = 0x07
+VERIFY_TARGET_CSC1 = 0x39
+VERIFY_TARGET_CSC2 = 0x3B
 
 
-def _transmit(conn, apdu: list[int]) -> Tuple[bytes, int, int]:
-    data, sw1, sw2 = conn.transmit(apdu)
-    return bytes(data), int(sw1), int(sw2)
+def _sha256(b: bytes) -> bytes:
+    return hashlib.sha256(b).digest()
 
 
-def _transmit_with_t0_fixes(conn, apdu: list[int]) -> Tuple[bytes, int, int]:
-    data, sw1, sw2 = _transmit(conn, apdu)
+def _chunks4(b: bytes):
+    if len(b) % 4 != 0:
+        raise CardError("record_len_not_multiple_of_4")
+    return [b[i:i + 4] for i in range(0, len(b), 4)]
 
-    if sw1 == 0x6C:
-        apdu2 = apdu[:-1] + [sw2]
-        data, sw1, sw2 = _transmit(conn, apdu2)
 
-    if sw1 == 0x61:
-        le = sw2 if sw2 != 0x00 else 0xFF
-        extra, sw1b, sw2b = _transmit(conn, [apdu[0], 0xC0, 0x00, 0x00, le])
-        data = data + extra
-        sw1, sw2 = sw1b, sw2b
-
-    return data, sw1, sw2
+@dataclass
+class AppRecord:
+    card_uid: str
+    user_hash8: str
+    tpl_hash8: str
 
 
 class CardSession:
-    MAGIC = b"CP01"
-    OFFSET_MAGIC = 0
-    OFFSET_UID = 4
-    UID_LEN = 16
-    OFFSET_USERLEN = 20
-    OFFSET_USER = 21
-    USER_MAX = 32
-    OFFSET_TPL = 53
-    TPL_LEN = 16
-
-    def __init__(self, reader, conn, atr: bytes):
-        self.reader_obj = reader
-        self.conn = conn
-        self.atr = atr
-        self.cla = 0x00
+    def __init__(self, timeout_seconds: int = 10):
+        self.timeout_seconds = timeout_seconds
+        self.cla = 0x80
+        self._svc = None
+        self._conn = None
+        self.atr_hex = ""
+        self._acquire()
 
     @property
-    def atr_hex(self) -> str:
-        return _bytes_to_hex(self.atr)
+    def conn(self):
+        if self._conn is None:
+            raise CardError("no_connection")
+        return self._conn
 
-    @property
-    def reader(self) -> str:
-        return str(self.reader_obj)
+    def _acquire(self) -> None:
+        req = CardRequest(timeout=self.timeout_seconds, cardType=GCM_CARD_TYPE)
+        svc = req.waitforcard()
+        conn = svc.connection
+        conn.connect(protocol=CardConnection.T0_protocol)
+        atr = bytes(conn.getATR())
+        self._svc = svc
+        self._conn = conn
+        self.atr_hex = " ".join(f"{x:02X}" for x in atr)
 
-    def _connect(self) -> None:
-        from smartcard.CardConnection import CardConnection
-        self.conn.connect(protocol=CardConnection.T0_protocol)
-
-    def _reopen(self) -> None:
-        self.conn = self.reader_obj.createConnection()
-        self._connect()
-        self.atr = bytes(self.conn.getATR())
-
-    def _tx(self, apdu: list[int]) -> Tuple[bytes, int, int]:
-        try:
-            return _transmit_with_t0_fixes(self.conn, apdu)
-        except Exception as e1:
+    def _reacquire(self) -> None:
+        last = None
+        for _ in range(3):
             try:
-                try:
-                    self.conn.disconnect()
-                except Exception:
-                    pass
-                self._reopen()
-                return _transmit_with_t0_fixes(self.conn, apdu)
-            except Exception as e2:
-                raise CardError(f"transmit_failed: {e1} / reconnect_failed: {e2}")
+                self._acquire()
+                return
+            except Exception as e:
+                last = e
+                time.sleep(0.2)
+        raise CardError(f"reacquire_failed: {last}")
 
-    def _tx_auto_cla(self, ins: int, p1: int, p2: int, lc_data: Optional[bytes] = None, le: Optional[int] = None) -> Tuple[bytes, int, int]:
-        if lc_data is not None and le is not None:
-            raise ValueError("bad_apdu_params")
+    def _transmit(self, apdu) -> Tuple[bytes, int, int]:
+        try:
+            data, sw1, sw2 = self.conn.transmit(apdu)
+            return bytes(data), sw1, sw2
+        except CardConnectionException:
+            self._reacquire()
+            data, sw1, sw2 = self.conn.transmit(apdu)
+            return bytes(data), sw1, sw2
 
-        def build(cla: int) -> list[int]:
-            if lc_data is not None:
-                return [cla, ins, p1, p2, len(lc_data)] + list(lc_data)
-            if le is not None:
-                return [cla, ins, p1, p2, le]
-            return [cla, ins, p1, p2]
-
-        apdu = build(self.cla)
-        data, sw1, sw2 = self._tx(apdu)
-        if (sw1, sw2) == (0x6D, 0x00):
-            for cand in (0xA0, 0x80, 0x00):
-                if cand == self.cla:
-                    continue
-                data2, sw1b, sw2b = self._tx(build(cand))
-                if (sw1b, sw2b) != (0x6D, 0x00):
-                    self.cla = cand
-                    return data2, sw1b, sw2b
-            return data, sw1, sw2
-        return data, sw1, sw2
-
-    def read_binary(self, offset: int, length: int) -> bytes:
-        if offset < 0 or length <= 0 or length > 0xFF:
-            raise ValueError("invalid_offset_or_length")
-
-        p1 = (offset >> 8) & 0xFF
-        p2 = offset & 0xFF
-        data, sw1, sw2 = self._tx_auto_cla(0xB0, p1, p2, le=length)
-
+    def read_word(self, addr: int) -> bytes:
+        apdu = [self.cla, INS_READ, 0x00, addr & 0xFF, 0x04]
+        data, sw1, sw2 = self._transmit(apdu)
         if (sw1, sw2) != (0x90, 0x00):
-            raise CardError(f"read_binary_sw={sw1:02X}{sw2:02X}")
-
+            raise CardError(f"read_word_sw={sw1:02X}{sw2:02X}")
+        if len(data) != 4:
+            raise CardError("read_word_len")
         return data
 
-    def update_binary(self, offset: int, data: bytes) -> None:
-        if offset < 0 or not data or len(data) > 0xFF:
-            raise ValueError("invalid_offset_or_data")
-
-        p1 = (offset >> 8) & 0xFF
-        p2 = offset & 0xFF
-        _, sw1, sw2 = self._tx_auto_cla(0xD6, p1, p2, lc_data=data)
-
+    def update_word(self, addr: int, word4: bytes) -> None:
+        if len(word4) != 4:
+            raise CardError("update_word_len")
+        apdu = [self.cla, INS_UPDATE, 0x00, addr & 0xFF, 0x04] + list(word4)
+        _, sw1, sw2 = self._transmit(apdu)
         if (sw1, sw2) != (0x90, 0x00):
-            raise CardError(f"update_binary_sw={sw1:02X}{sw2:02X}")
+            raise CardError(f"update_word_sw={sw1:02X}{sw2:02X}")
 
-    def atr_derived_uid(self) -> str:
-        d = hashlib.sha256(self.atr).digest()[:16]
-        return d.hex()
+    def verify(self, target: int, code4: bytes) -> None:
+        if len(code4) != 4:
+            raise CardError("verify_len")
+        apdu = [0x00, INS_VERIFY, 0x00, target & 0xFF, 0x04] + list(code4)
+        _, sw1, sw2 = self._transmit(apdu)
+        if (sw1, sw2) != (0x90, 0x00):
+            raise CardError(f"verify_sw={sw1:02X}{sw2:02X}")
 
-    def ensure_provisioned(self) -> str:
+    def get_issuer_sn(self) -> bytes:
+        out = b""
+        for a in range(ADDR_ISSUER_BASE, ADDR_ISSUER_BASE + 4):
+            out += self.read_word(a)
+        return out
+
+    def uid_from_issuer(self) -> str:
+        issuer = self.get_issuer_sn()
+        raw = issuer + bytes.fromhex(self.atr_hex.replace(" ", ""))
+        return _sha256(raw)[:16].hex()
+
+    def read_app_record(self) -> Optional[AppRecord]:
+        raw = b""
         try:
-            _ = self.read_binary(0, 1)
-        except CardError as e:
-            if "6D00" in str(e):
-                return self.atr_derived_uid()
-            raise
+            for i in range(APP_WORD_LEN):
+                raw += self.read_word(APP_WORD_BASE + i)
+        except Exception:
+            return None
 
-        blob = self.read_binary(0, self.OFFSET_TPL + self.TPL_LEN)
-        magic = blob[self.OFFSET_MAGIC:self.OFFSET_MAGIC + 4]
-        if magic == self.MAGIC:
-            uid = blob[self.OFFSET_UID:self.OFFSET_UID + self.UID_LEN]
-            if len(uid) == self.UID_LEN and any(b != 0x00 for b in uid):
-                return uid.hex()
+        if raw[:4] != MAGIC:
+            return None
 
-        uid = os.urandom(self.UID_LEN)
-        user_len = bytes([0])
-        user_pad = bytes([0] * self.USER_MAX)
-        tpl = bytes([0] * self.TPL_LEN)
-        payload = self.MAGIC + uid + user_len + user_pad + tpl
-        self.update_binary(0, payload)
-        return uid.hex()
+        card_uid = raw[4:20].hex()
+        user_hash8 = raw[20:28].hex()
+        tpl_hash8 = raw[28:36].hex()
+        return AppRecord(card_uid=card_uid, user_hash8=user_hash8, tpl_hash8=tpl_hash8)
 
-    def write_user_mapping(self, user_id: str, template_sha256_hex: Optional[str] = None) -> None:
-        try:
-            _ = self.read_binary(0, 1)
-        except CardError as e:
-            if "6D00" in str(e):
+    def _build_record(self, card_uid16: bytes, user_id: str, tpl_sha256_hex: str) -> bytes:
+        user_hash8 = _sha256(user_id.encode("utf-8"))[:8]
+        tpl_hash8 = bytes.fromhex(tpl_sha256_hex)[:8]
+        tail = b"\x00\x00\x00\x00"
+        return MAGIC + card_uid16 + user_hash8 + tpl_hash8 + tail
+
+    def _try_unlock_user1(self) -> None:
+        for t, c in [
+            (VERIFY_TARGET_CSC1, DEFAULT_CSC1),
+            (VERIFY_TARGET_CSC0, DEFAULT_CSC0),
+            (VERIFY_TARGET_CSC2, DEFAULT_CSC2),
+        ]:
+            try:
+                self.verify(t, c)
                 return
-            raise
+            except Exception:
+                continue
 
-        raw = user_id.encode("utf-8", errors="ignore")[:self.USER_MAX]
-        user_len = bytes([len(raw)])
-        user_pad = raw + bytes([0] * (self.USER_MAX - len(raw)))
+    def write_app_record(self, user_id: str, tpl_sha256_hex: str, card_uid16: Optional[bytes] = None) -> str:
+        if card_uid16 is None:
+            card_uid16 = os.urandom(16)
 
-        tpl16 = bytes([0] * self.TPL_LEN)
-        if template_sha256_hex:
-            full = bytes.fromhex(template_sha256_hex.strip())
-            tpl16 = full[:self.TPL_LEN].ljust(self.TPL_LEN, b"\x00")
+        rec = self._build_record(card_uid16, user_id, tpl_sha256_hex)
+        words = _chunks4(rec)
 
-        self.update_binary(self.OFFSET_USERLEN, user_len + user_pad + tpl16)
+        self._try_unlock_user1()
+        for i, w in enumerate(words):
+            self.update_word(APP_WORD_BASE + i, w)
 
+        return card_uid16.hex()
 
-def open_card(timeout_seconds: int = 30, reader_index: int = 0) -> CardSession:
-    from smartcard.System import readers
+    def provision_or_load_uid(self, user_id: str, tpl_sha256_hex: str) -> Tuple[str, bool]:
+        r = self.read_app_record()
+        if r is not None:
+            return r.card_uid, False
+        uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=None)
+        return uid, True
 
-    rlist = readers()
-    if not rlist:
-        raise CardError("no_reader")
-
-    if reader_index < 0 or reader_index >= len(rlist):
-        raise CardError(f"bad_reader_index: {reader_index}")
-
-    reader = rlist[reader_index]
-    deadline = time.time() + max(1, int(timeout_seconds))
-    last_err: Optional[Exception] = None
-
-    while time.time() < deadline:
-        try:
-            conn = reader.createConnection()
-            sess = CardSession(reader=reader, conn=conn, atr=b"")
-            sess._connect()
-            sess.atr = bytes(sess.conn.getATR())
-            return sess
-        except Exception as e:
-            last_err = e
-            time.sleep(0.2)
-
-    raise CardError(f"wait_or_connect_failed: {last_err}")
+    def get_uid_or_none(self) -> Optional[str]:
+        r = self.read_app_record()
+        return None if r is None else r.card_uid
 
 
-def get_card_id(simulate_card: Optional[str], timeout_seconds: int = 30) -> CardInfo:
-    if simulate_card:
-        return CardInfo(card_id=simulate_card.strip(), atr_hex="SIMULATED", reader="SIMULATED")
-
-    sess = open_card(timeout_seconds=timeout_seconds)
-    uid = sess.ensure_provisioned()
-    return CardInfo(card_id=uid, atr_hex=sess.atr_hex, reader=sess.reader)
+def open_card(timeout_seconds: int = 10) -> CardSession:
+    return CardSession(timeout_seconds=timeout_seconds)
 
 
 FILE: src/config.py
@@ -801,21 +724,19 @@ def load_config(path: str = "config.yaml") -> AppConfig:
 
 FILE: src/db.py
 
-# FILE: /home/vboxuser/Desktop/CartePuce/src/db.py
 from __future__ import annotations
 
 import os
 import sqlite3
 from typing import Optional, Any, Dict
 
-
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS users (
   user_id      TEXT PRIMARY KEY,
-  card_id      TEXT UNIQUE NOT NULL,  -- 实际存 card_uid（hex）
-  card_atr     TEXT,                  -- 记录 ATR 便于审计/排错
+  card_id      TEXT UNIQUE NOT NULL,
+  card_atr     TEXT,
   pwd_salt     BLOB NOT NULL,
   pwd_hash     BLOB NOT NULL,
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
@@ -833,7 +754,7 @@ CREATE TABLE IF NOT EXISTS biometrics (
 CREATE TABLE IF NOT EXISTS auth_logs (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   ts        TEXT NOT NULL DEFAULT (datetime('now')),
-  card_id   TEXT,    -- card_uid
+  card_id   TEXT,
   card_atr  TEXT,
   user_id   TEXT,
   pwd_ok    INTEGER,
@@ -868,13 +789,18 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     conn.commit()
 
-    # 兼容旧 DB：如果之前没有这些列，补上
     _ensure_column(conn, "users", "card_atr", "card_atr TEXT")
     _ensure_column(conn, "auth_logs", "card_atr", "card_atr TEXT")
 
 
-def upsert_user(conn: sqlite3.Connection, user_id: str, card_id: str, pwd_salt: bytes, pwd_hash: bytes,
-                card_atr: Optional[str] = None) -> None:
+def upsert_user(
+    conn: sqlite3.Connection,
+    user_id: str,
+    card_id: str,
+    pwd_salt: bytes,
+    pwd_hash: bytes,
+    card_atr: Optional[str] = None,
+) -> None:
     conn.execute(
         """
         INSERT INTO users(user_id, card_id, card_atr, pwd_salt, pwd_hash)
@@ -890,8 +816,13 @@ def upsert_user(conn: sqlite3.Connection, user_id: str, card_id: str, pwd_salt: 
     conn.commit()
 
 
-def upsert_biometric(conn: sqlite3.Connection, user_id: str, template_path: str,
-                     template_sha256: str, algo: str) -> None:
+def upsert_biometric(
+    conn: sqlite3.Connection,
+    user_id: str,
+    template_path: str,
+    template_sha256: str,
+    algo: str,
+) -> None:
     conn.execute(
         """
         INSERT INTO biometrics(user_id, template_path, template_sha256, algo)
@@ -920,8 +851,16 @@ def get_user_by_card(conn: sqlite3.Connection, card_id: str) -> Optional[Dict[st
     return dict(row) if row else None
 
 
-def log_auth(conn: sqlite3.Connection, card_id: str, card_atr: Optional[str], user_id: Optional[str],
-             pwd_ok: bool, bio_score: Optional[float], decision: str, reason: str) -> None:
+def log_auth(
+    conn: sqlite3.Connection,
+    card_id: str,
+    card_atr: Optional[str],
+    user_id: Optional[str],
+    pwd_ok: bool,
+    bio_score: Optional[float],
+    decision: str,
+    reason: str,
+) -> None:
     conn.execute(
         """
         INSERT INTO auth_logs(card_id, card_atr, user_id, pwd_ok, bio_score, decision, reason)

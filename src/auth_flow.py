@@ -1,5 +1,5 @@
-# FILE: /home/vboxuser/Desktop/CartePuce/src/auth_flow.py
 from __future__ import annotations
+
 import os
 import cv2
 from dataclasses import dataclass
@@ -7,23 +7,20 @@ from typing import Optional
 
 from .config import AppConfig
 from .db import get_user_by_card, log_auth
-from .security import verify_pin
+from .security.security import verify_pin
 from .camera import CameraParams, capture_frame
 from .bio import compare_biometric
 
 
 @dataclass
 class AuthResult:
-    decision: str  # "ALLOW" | "DENY"
+    decision: str
     reason: str
     user_id: Optional[str] = None
     bio_score: Optional[float] = None
 
 
-def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], pin: str) -> AuthResult:
-    """
-    card_id: 实际是 card_uid（从卡内 APDU 读出/初始化）
-    """
+def run_auth_flow(cfg: AppConfig, conn, card_id: str, pin: str, card_atr: Optional[str] = None) -> AuthResult:
     user = get_user_by_card(conn, card_id)
     if not user:
         log_auth(conn, card_id, card_atr, None, False, None, "DENY", "unknown_card")
@@ -31,13 +28,11 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
 
     user_id = user["user_id"]
 
-    # 1) PIN verification
     pwd_ok = verify_pin(pin, user["pwd_salt"], user["pwd_hash"])
     if not pwd_ok:
         log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", "bad_pin")
         return AuthResult(decision="DENY", reason="bad_pin", user_id=user_id)
 
-    # 2) camera catch
     frame = capture_frame(CameraParams(
         index=cfg.camera.index,
         warmup_frames=cfg.camera.warmup_frames,
@@ -45,7 +40,6 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
         height=cfg.camera.height,
     ))
 
-    # 3) biologi model invoke
     template_path = user.get("template_path")
     if not template_path or not os.path.exists(template_path):
         log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "no_biometric_template")
@@ -56,7 +50,6 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
         log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "template_read_error")
         return AuthResult(decision="DENY", reason="template_read_error", user_id=user_id)
 
-    # compartion
     score = compare_biometric(
         captured_bgr=frame,
         template_bgr=template,

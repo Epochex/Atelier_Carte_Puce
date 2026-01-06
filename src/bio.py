@@ -64,9 +64,8 @@ def orb_score(img1_gray: np.ndarray, img2_gray: np.ndarray, nfeatures: int = 800
     if not matches:
         return 0.0
 
-    # 距离越小越相似；取“好匹配”占比作为分数
     matches = sorted(matches, key=lambda m: m.distance)
-    good = [m for m in matches if m.distance < 50]  # 经验阈值
+    good = [m for m in matches if m.distance < 50]  
     score = len(good) / max(len(matches), 1)
     return float(score)
 
