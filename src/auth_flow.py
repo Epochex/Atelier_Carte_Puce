@@ -31,13 +31,13 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
 
     user_id = user["user_id"]
 
-    # 1) PIN 验证（当前先用 DB 校验；后续可加卡内 PIN2/3 VERIFY）
+    # 1) PIN verification
     pwd_ok = verify_pin(pin, user["pwd_salt"], user["pwd_hash"])
     if not pwd_ok:
         log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", "bad_pin")
         return AuthResult(decision="DENY", reason="bad_pin", user_id=user_id)
 
-    # 2) 摄像头抓帧
+    # 2) camera catch
     frame = capture_frame(CameraParams(
         index=cfg.camera.index,
         warmup_frames=cfg.camera.warmup_frames,
@@ -45,7 +45,7 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
         height=cfg.camera.height,
     ))
 
-    # 3) 生物模板加载
+    # 3) biologi model invoke
     template_path = user.get("template_path")
     if not template_path or not os.path.exists(template_path):
         log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "no_biometric_template")
@@ -56,7 +56,7 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
         log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "template_read_error")
         return AuthResult(decision="DENY", reason="template_read_error", user_id=user_id)
 
-    # 4) 比对
+    # compartion
     score = compare_biometric(
         captured_bgr=frame,
         template_bgr=template,
