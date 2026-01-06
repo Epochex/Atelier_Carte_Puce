@@ -22,7 +22,7 @@ class AuthResult:
 
 def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], pin: str) -> AuthResult:
     """
-    card_id: 实际是 card_uid（从卡内 APDU 读出/初始化）
+    card_id: actually the card_uid (read or initialized from the card via APDU)
     """
     user = get_user_by_card(conn, card_id)
     if not user:

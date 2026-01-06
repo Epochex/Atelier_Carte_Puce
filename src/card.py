@@ -20,9 +20,9 @@ GCM_ATR = [0x3B, 0x02, 0x53, 0x01]
 GCM_ATR_MASK = [0xFF, 0xFF, 0xFF, 0x00]
 GCM_CARD_TYPE = ATRCardType(GCM_ATR, GCM_ATR_MASK)
 
-INS_READ = 0xBE
-INS_UPDATE = 0xDE
-INS_VERIFY = 0x20
+INS_READ = 0xBE # read 4 bytes from an addr
+INS_UPDATE = 0xDE # write 4 bytes to an addr
+INS_VERIFY = 0x20 # verify code on card
 
 ADDR_ISSUER_BASE = 0x01
 ADDR_USER1_BASE = 0x10
@@ -47,7 +47,7 @@ def _sha256(b: bytes) -> bytes:
 
 def _chunks4(b: bytes):
     if len(b) % 4 != 0:
-        raise CardError("record_len_not_multiple_of_4")
+        raise CardError("record length not multiple of 4")
     return [b[i:i + 4] for i in range(0, len(b), 4)]
 
 
@@ -193,9 +193,29 @@ class CardSession:
         uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=None)
         return uid, True
 
-    def get_uid_or_none(self) -> Optional[str]:
+    def get_uid(self) -> Optional[str]:
         r = self.read_app_record()
         return None if r is None else r.card_uid
+
+
+@dataclass
+class CardInfo:
+    card_id: Optional[str]
+    atr_hex: Optional[str]
+
+
+def get_card_id(simulate_card=None, timeout_seconds: int = 10) -> CardInfo:
+    """Return CardInfo for the first detected card or simulated info.
+    If a card is not present or an error occurs, returns CardInfo(card_id=None, atr_hex=None).
+    """
+    if simulate_card is not None:
+        # expected format: {'card_id': str, 'atr_hex': str}
+        return CardInfo(card_id=simulate_card.get('card_id'), atr_hex=simulate_card.get('atr_hex'))
+    try:
+        s = CardSession(timeout_seconds=timeout_seconds)
+    except Exception:
+        return CardInfo(card_id=None, atr_hex=None)
+    return CardInfo(card_id=s.get_uid(), atr_hex=s.atr_hex)
 
 
 def open_card(timeout_seconds: int = 10) -> CardSession:

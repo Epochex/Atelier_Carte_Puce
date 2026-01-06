@@ -10,7 +10,7 @@ def main():
     init_db(conn)
 
     s = open_card(10)
-    card_uid = s.get_uid_or_none()
+    card_uid = s.get_uid()
     if not card_uid:
         print("DENY  user=None bio_score=None reason=unknown_card")
         return
@@ -19,7 +19,7 @@ def main():
 
     pin = input("Enter PIN/mot de passe: ").strip()
 
-    result = run_auth_flow(cfg, conn, card_id=card_uid, pin=pin)
+    result = run_auth_flow(cfg, conn, card_id=card_uid, card_atr=s.atr_hex, pin=pin)
 
     if result.decision == "ALLOW":
         print(f"ALLOW user={result.user_id} bio_score={result.bio_score:.3f} reason={result.reason}")

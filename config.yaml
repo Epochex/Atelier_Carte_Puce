@@ -7,11 +7,11 @@ camera:
   height: 480
 
 biometric:
-  # ORB 匹配分数阈值（0~1）。越高越严格
+  # ORB matching score threshold (0-1). Higher values are stricter
   score_threshold: 0.18
-  # 是否尝试人脸裁剪（失败则回退到中心裁剪）
+  # Whether to attempt face cropping (fallback to center crop on failure)
   use_face_crop: true
-  # ORB 特征点数
+  # Number of ORB features
   orb_nfeatures: 800
 
 auth:
