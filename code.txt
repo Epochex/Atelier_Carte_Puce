@@ -26,7 +26,13 @@ CartePuce/
   ├── card.py
   ├── config.py
   ├── db.py
-  ├── security.py
+  ├── security/
+    ├── __init__.py
+    ├── audit_logging.py
+    ├── hmac_challenge_response.py
+    ├── password_hashing.py
+    ├── replay_protection.py
+    ├── template_integrity.py
 
 
 FILE: get_code.py
@@ -124,7 +130,7 @@ def main():
     init_db(conn)
 
     s = open_card(10)
-    card_uid = s.get_uid_or_none()
+    card_uid = s.get_uid()
     if not card_uid:
         print("DENY  user=None bio_score=None reason=unknown_card")
         return
@@ -133,7 +139,7 @@ def main():
 
     pin = input("Enter PIN/mot de passe: ").strip()
 
-    result = run_auth_flow(cfg, conn, card_id=card_uid, pin=pin)
+    result = run_auth_flow(cfg, conn, card_id=card_uid, card_atr=s.atr_hex, pin=pin)
 
     if result.decision == "ALLOW":
         print(f"ALLOW user={result.user_id} bio_score={result.bio_score:.3f} reason={result.reason}")
@@ -241,11 +247,69 @@ if __name__ == "__main__":
 
 FILE: scripts/test_card.py
 
-from src.card import get_card_id
+import argparse
+
+from src.card import CardSession
+
+
+def _print_app_record(r) -> None:
+    if r is None:
+        print("app_record: None")
+        return
+    print("app_record:")
+    print(f"  card_uid  = {r.card_uid}")
+    print(f"  user_hash8 = {r.user_hash8}")
+    print(f"  tpl_hash8  = {r.tpl_hash8}")
+
 
 def main():
-    info = get_card_id(simulate_card=None, timeout_seconds=30)
-    print(f"card_id(ATR) = {info.card_id}")
+    parser = argparse.ArgumentParser(description="Print detailed card information")
+    parser.add_argument("--timeout", type=int, default=30, help="Timeout seconds when waiting for a card")
+    parser.add_argument("--simulate-card-id", dest="sim_card_id", help="Simulated card_id (for offline testing)")
+    parser.add_argument("--simulate-atr", dest="sim_atr", help="Simulated ATR hex string (for offline testing)")
+    args = parser.parse_args()
+
+    # If simulation args are provided, print them and exit
+    if args.sim_card_id or args.sim_atr:
+        print("Simulated card info:")
+        print(f"  card_id = {args.sim_card_id}")
+        print(f"  atr_hex = {args.sim_atr}")
+        return
+
+    try:
+        s = CardSession(timeout_seconds=args.timeout)
+    except Exception as e:
+        print(f"No card found or error: {e}")
+        return
+
+    # ATR
+    print(f"ATR: {s.atr_hex}")
+
+    # Issuer SN
+    try:
+        issuer = s.get_issuer_sn()
+        print(f"Issuer SN (raw): {issuer.hex()}")
+    except Exception as e:
+        print(f"Could not read issuer SN: {e}")
+
+    # UID derived from issuer
+    try:
+        uid_from_issuer = s.uid_from_issuer()
+        print(f"UID from issuer: {uid_from_issuer}")
+    except Exception as e:
+        print(f"Could not compute uid from issuer: {e}")
+
+    # Stored app record UID
+    card_id = s.get_uid()
+    print(f"Stored card_id (app record): {card_id}")
+
+    # App record details
+    try:
+        app = s.read_app_record()
+        _print_app_record(app)
+    except Exception as e:
+        print(f"Could not read app record: {e}")
+
 
 if __name__ == "__main__":
     main()
@@ -257,8 +321,8 @@ FILE: src/__init__.py
 
 FILE: src/auth_flow.py
 
-# FILE: /home/vboxuser/Desktop/CartePuce/src/auth_flow.py
 from __future__ import annotations
+
 import os
 import cv2
 from dataclasses import dataclass
@@ -273,16 +337,13 @@ from .bio import compare_biometric
 
 @dataclass
 class AuthResult:
-    decision: str  # "ALLOW" | "DENY"
+    decision: str
     reason: str
     user_id: Optional[str] = None
     bio_score: Optional[float] = None
 
 
-def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], pin: str) -> AuthResult:
-    """
-    card_id: 实际是 card_uid（从卡内 APDU 读出/初始化）
-    """
+def run_auth_flow(cfg: AppConfig, conn, card_id: str, pin: str, card_atr: Optional[str] = None) -> AuthResult:
     user = get_user_by_card(conn, card_id)
     if not user:
         log_auth(conn, card_id, card_atr, None, False, None, "DENY", "unknown_card")
@@ -290,13 +351,11 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
 
     user_id = user["user_id"]
 
-    # 1) PIN verification
     pwd_ok = verify_pin(pin, user["pwd_salt"], user["pwd_hash"])
     if not pwd_ok:
         log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", "bad_pin")
         return AuthResult(decision="DENY", reason="bad_pin", user_id=user_id)
 
-    # 2) camera catch
     frame = capture_frame(CameraParams(
         index=cfg.camera.index,
         warmup_frames=cfg.camera.warmup_frames,
@@ -304,7 +363,6 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
         height=cfg.camera.height,
     ))
 
-    # 3) biologi model invoke
     template_path = user.get("template_path")
     if not template_path or not os.path.exists(template_path):
         log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "no_biometric_template")
@@ -315,7 +373,6 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, card_atr: Optional[str], p
         log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "template_read_error")
         return AuthResult(decision="DENY", reason="template_read_error", user_id=user_id)
 
-    # compartion
     score = compare_biometric(
         captured_bgr=frame,
         template_bgr=template,
@@ -477,9 +534,9 @@ GCM_ATR = [0x3B, 0x02, 0x53, 0x01]
 GCM_ATR_MASK = [0xFF, 0xFF, 0xFF, 0x00]
 GCM_CARD_TYPE = ATRCardType(GCM_ATR, GCM_ATR_MASK)
 
-INS_READ = 0xBE
-INS_UPDATE = 0xDE
-INS_VERIFY = 0x20
+INS_READ = 0xBE  # read 4 bytes from an addr
+INS_UPDATE = 0xDE  # write 4 bytes to an addr
+INS_VERIFY = 0x20  # verify code on card
 
 ADDR_ISSUER_BASE = 0x01
 ADDR_USER1_BASE = 0x10
@@ -504,7 +561,7 @@ def _sha256(b: bytes) -> bytes:
 
 def _chunks4(b: bytes):
     if len(b) % 4 != 0:
-        raise CardError("record_len_not_multiple_of_4")
+        raise CardError("record length not multiple of 4")
     return [b[i:i + 4] for i in range(0, len(b), 4)]
 
 
@@ -650,9 +707,33 @@ class CardSession:
         uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=None)
         return uid, True
 
-    def get_uid_or_none(self) -> Optional[str]:
+    def get_uid(self) -> Optional[str]:
         r = self.read_app_record()
         return None if r is None else r.card_uid
+
+    # Backward compatibility for your current workspace (older scripts may still call this)
+    def get_uid_or_none(self) -> Optional[str]:
+        return self.get_uid()
+
+
+@dataclass
+class CardInfo:
+    card_id: Optional[str]
+    atr_hex: Optional[str]
+
+
+def get_card_id(simulate_card=None, timeout_seconds: int = 10) -> CardInfo:
+    """Return CardInfo for the first detected card or simulated info.
+    If a card is not present or an error occurs, returns CardInfo(card_id=None, atr_hex=None).
+    """
+    if simulate_card is not None:
+        # expected format: {'card_id': str, 'atr_hex': str}
+        return CardInfo(card_id=simulate_card.get("card_id"), atr_hex=simulate_card.get("atr_hex"))
+    try:
+        s = CardSession(timeout_seconds=timeout_seconds)
+    except Exception:
+        return CardInfo(card_id=None, atr_hex=None)
+    return CardInfo(card_id=s.get_uid(), atr_hex=s.atr_hex)
 
 
 def open_card(timeout_seconds: int = 10) -> CardSession:
@@ -871,23 +952,401 @@ def log_auth(
     conn.commit()
 
 
-FILE: src/security.py
+FILE: src/security/__init__.py
 
+# src/security/__init__.py
+"""
+Security package.
+
+This package centralizes:
+- Password hashing / verification (PBKDF2 + optional pepper)
+- HMAC-based challenge-response primitives (nonce/counter/context/tag)
+- Replay protection (nonce cache, in-memory demo-grade)
+- Template integrity checks (anti-tamper)
+- Audit context encoding (compact, log-friendly)
+
+Backward compatibility:
+Existing imports like:
+    from src.security import pbkdf2_hash_pin, verify_pin
+should continue to work.
+"""
+
+from .password_hashing import pbkdf2_hash_pin, verify_pin
+from .hmac_challenge_response import (
+    generate_nonce,
+    compute_hmac_tag,
+    verify_hmac_tag,
+    new_card_key,
+    key_id_from_key,
+    build_hmac_message,
+)
+from .replay_protection import NonceReplayProtector
+from .template_integrity import sha256_file_hex, verify_file_sha256
+from .audit_logging import (
+    build_audit_context,
+    encode_audit_context,
+    compact_reason,
+)
+
+
+FILE: src/security/audit_logging.py
+
+# src/security/audit_logging.py
 from __future__ import annotations
+
+import json
 import os
+import platform
+from typing import Any, Dict, Optional
+
+
+def _device_identity() -> str:
+    """
+    Best-effort device identifier for audit logs.
+    Not a security guarantee; used to support threat analysis (stolen reader / tampered terminal).
+    """
+    host = platform.node() or "unknown-host"
+    sysname = platform.system() or "unknown-os"
+    return f"{sysname}:{host}"
+
+
+def build_audit_context(
+    *,
+    nonce: Optional[bytes] = None,
+    counter: Optional[int] = None,
+    key_id: Optional[str] = None,
+    tag: Optional[bytes] = None,
+    context: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Build a JSON-serializable dict for audit logs.
+    """
+    d: Dict[str, Any] = {
+        "device": _device_identity(),
+    }
+
+    if nonce is not None:
+        d["nonce"] = bytes(nonce).hex()
+    if counter is not None:
+        d["counter"] = int(counter)
+    if key_id is not None:
+        d["key_id"] = str(key_id)
+    if tag is not None:
+        d["tag"] = bytes(tag).hex()
+    if context is not None:
+        d["context"] = str(context)
+
+    if extra:
+        # Ensure extra is JSON-serializable
+        for k, v in extra.items():
+            d[str(k)] = v
+
+    return d
+
+
+def encode_audit_context(ctx: Dict[str, Any], max_len: int = 512) -> str:
+    """
+    Encode context as compact JSON string.
+    If too long, truncate deterministically.
+    """
+    s = json.dumps(ctx, separators=(",", ":"), ensure_ascii=False)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
+def compact_reason(reason: str, audit_context_json: Optional[str] = None) -> str:
+    """
+    Pack reason + audit context into a single string suitable for existing auth_logs.reason.
+
+    Example:
+      "bad_pin|ctx={...}"
+    """
+    r = (reason or "").strip() or "unknown"
+    if not audit_context_json:
+        return r
+    return f"{r}|ctx={audit_context_json}"
+
+
+FILE: src/security/hmac_challenge_response.py
+
+# src/security/hmac_challenge_response.py
+from __future__ import annotations
+
 import hashlib
 import hmac
+import os
+from typing import Tuple
 
 
-def pbkdf2_hash_pin(pin: str, salt: bytes | None = None, iterations: int = 200_000) -> tuple[bytes, bytes]:
+_HMAC_VERSION_PREFIX = b"CP-AUTH-HMAC-V1\x00"
+
+
+def generate_nonce(length: int = 16) -> bytes:
+    """
+    Random nonce for each authentication attempt.
+    16 bytes is sufficient for demo-grade replay protection.
+    """
+    if length < 12:
+        raise ValueError("nonce_length_too_small")
+    return os.urandom(length)
+
+
+def new_card_key(length: int = 32) -> bytes:
+    """
+    Generate per-card secret key K_card.
+    """
+    if length < 16:
+        raise ValueError("card_key_length_too_small")
+    return os.urandom(length)
+
+
+def key_id_from_key(k_card: bytes, length: int = 8) -> str:
+    """
+    Derive a public key identifier (not secret) from K_card.
+    Can be stored on card as key_id to locate DB record.
+
+    Default: 8 bytes (16 hex chars).
+    """
+    if length < 4:
+        raise ValueError("key_id_length_too_small")
+    digest = hashlib.sha256(k_card).digest()
+    return digest[:length].hex()
+
+
+def _card_uid_hex_to_bytes(card_uid_hex: str) -> bytes:
+    s = (card_uid_hex or "").strip().lower()
+    if len(s) != 32:
+        # Your current card_uid is 16 bytes hex => 32 chars
+        raise ValueError("card_uid_expected_16_bytes_hex")
+    return bytes.fromhex(s)
+
+
+def build_hmac_message(
+    card_uid_hex: str,
+    nonce: bytes,
+    counter: int,
+    context: str,
+) -> bytes:
+    """
+    Canonical message: prefix || card_uid(16B) || nonce || counter(4B BE) || context(utf-8)
+    """
+    if not isinstance(nonce, (bytes, bytearray)) or len(nonce) < 12:
+        raise ValueError("invalid_nonce")
+    if counter < 0 or counter > 0xFFFFFFFF:
+        raise ValueError("counter_out_of_range")
+
+    card_uid = _card_uid_hex_to_bytes(card_uid_hex)
+    counter_be = int(counter).to_bytes(4, "big", signed=False)
+    ctx = (context or "").encode("utf-8")
+
+    return _HMAC_VERSION_PREFIX + card_uid + bytes(nonce) + counter_be + ctx
+
+
+def compute_hmac_tag(k_card: bytes, message: bytes, tag_len: int = 32) -> bytes:
+    """
+    Compute HMAC-SHA256 tag (optionally truncated).
+    """
+    if not isinstance(k_card, (bytes, bytearray)) or len(k_card) < 16:
+        raise ValueError("invalid_k_card")
+    full = hmac.new(bytes(k_card), message, hashlib.sha256).digest()
+    if tag_len <= 0 or tag_len > len(full):
+        raise ValueError("invalid_tag_len")
+    return full[:tag_len]
+
+
+def verify_hmac_tag(k_card: bytes, message: bytes, tag: bytes) -> bool:
+    """
+    Constant-time verification.
+    """
+    if not isinstance(tag, (bytes, bytearray)) or len(tag) == 0:
+        return False
+    expected = compute_hmac_tag(k_card, message, tag_len=len(tag))
+    return hmac.compare_digest(expected, bytes(tag))
+
+
+FILE: src/security/password_hashing.py
+
+# src/security/password_hashing.py
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import os
+from typing import Optional, Tuple
+
+
+_DEFAULT_ITERATIONS = 200_000
+
+
+def _load_pepper_bytes() -> bytes:
+    """
+    Optional server-side secret (pepper) to harden against offline guessing after DB compromise.
+    - If unset: return b"" (no pepper).
+    - If set: supports either raw string or base64 prefixed with "base64:".
+
+    Environment variable:
+      CARTEPUCE_PASSWORD_PEPPER
+        examples:
+          export CARTEPUCE_PASSWORD_PEPPER="my-long-random-pepper"
+          export CARTEPUCE_PASSWORD_PEPPER="base64:8cS7...=="
+    """
+    v = (os.environ.get("CARTEPUCE_PASSWORD_PEPPER") or "").strip()
+    if not v:
+        return b""
+    if v.startswith("base64:"):
+        return base64.b64decode(v[len("base64:") :].encode("utf-8"))
+    return v.encode("utf-8")
+
+
+def pbkdf2_hash_pin(
+    pin: str,
+    salt: Optional[bytes] = None,
+    iterations: int = _DEFAULT_ITERATIONS,
+) -> Tuple[bytes, bytes]:
+    """
+    Return (salt, derived_key).
+
+    NOTE:
+    - The pepper is NOT stored in DB.
+    - If you set pepper later, you should re-enroll users for strict correctness,
+      but verify_pin() is backward-compatible by trying both modes.
+    """
     if salt is None:
         salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, iterations, dklen=32)
+
+    pepper = _load_pepper_bytes()
+    material = pin.encode("utf-8") + pepper
+
+    dk = hashlib.pbkdf2_hmac("sha256", material, salt, iterations, dklen=32)
     return salt, dk
 
 
-def verify_pin(pin: str, salt: bytes, expected_hash: bytes, iterations: int = 200_000) -> bool:
-    dk = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, iterations, dklen=32)
-    return hmac.compare_digest(dk, expected_hash)
+def verify_pin(
+    pin: str,
+    salt: bytes,
+    expected_hash: bytes,
+    iterations: int = _DEFAULT_ITERATIONS,
+) -> bool:
+    """
+    Constant-time verification.
+
+    Backward compatibility strategy:
+    - If pepper is configured, try with pepper first.
+    - If fails and pepper is configured, try without pepper (older DB entries).
+    """
+    pepper = _load_pepper_bytes()
+
+    # Try with current pepper mode
+    material = pin.encode("utf-8") + pepper
+    dk = hashlib.pbkdf2_hmac("sha256", material, salt, iterations, dklen=32)
+    if hmac.compare_digest(dk, expected_hash):
+        return True
+
+    # Fallback: no-pepper compatibility
+    if pepper:
+        dk2 = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, iterations, dklen=32)
+        return hmac.compare_digest(dk2, expected_hash)
+
+    return False
+
+
+FILE: src/security/replay_protection.py
+
+# src/security/replay_protection.py
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+
+@dataclass
+class ReplayDecision:
+    ok: bool
+    reason: str
+
+
+class NonceReplayProtector:
+    """
+    In-memory nonce replay protector.
+    Scope: current process only.
+
+    Strategy:
+      - (card_id, nonce_hex) -> expiry_ts
+      - If seen and not expired => replay
+
+    Parameters:
+      ttl_seconds: how long a nonce is considered valid for anti-replay purposes.
+      max_entries: crude memory bound; oldest entries are evicted when over limit.
+    """
+
+    def __init__(self, ttl_seconds: int = 120, max_entries: int = 4096):
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds_must_be_positive")
+        if max_entries < 64:
+            raise ValueError("max_entries_too_small")
+        self.ttl_seconds = ttl_seconds
+        self.max_entries = max_entries
+        self._store: Dict[Tuple[str, str], float] = {}
+
+    def _purge_expired(self, now: float) -> None:
+        expired = [k for k, exp in self._store.items() if exp <= now]
+        for k in expired:
+            self._store.pop(k, None)
+
+    def _evict_if_needed(self) -> None:
+        if len(self._store) <= self.max_entries:
+            return
+        # Evict earliest-expiring items first
+        items = sorted(self._store.items(), key=lambda kv: kv[1])
+        for (k, _exp) in items[: max(1, len(self._store) - self.max_entries)]:
+            self._store.pop(k, None)
+
+    def check_and_remember(self, card_id: str, nonce: bytes) -> ReplayDecision:
+        now = time.time()
+        self._purge_expired(now)
+
+        nonce_hex = bytes(nonce).hex()
+        key = (card_id, nonce_hex)
+
+        if key in self._store:
+            return ReplayDecision(ok=False, reason="replay_nonce_seen")
+
+        self._store[key] = now + self.ttl_seconds
+        self._evict_if_needed()
+        return ReplayDecision(ok=True, reason="ok")
+
+
+FILE: src/security/template_integrity.py
+
+# src/security/template_integrity.py
+from __future__ import annotations
+
+import hashlib
+import os
+
+
+def sha256_file_hex(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_file_sha256(path: str, expected_hex: str) -> bool:
+    """
+    Returns True if the file exists and matches expected sha256 hex.
+    """
+    if not path or not os.path.exists(path) or not os.path.isfile(path):
+        return False
+    expected = (expected_hex or "").strip().lower()
+    if len(expected) != 64:
+        return False
+    actual = sha256_file_hex(path)
+    return actual == expected
 
 

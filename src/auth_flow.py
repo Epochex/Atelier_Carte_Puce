@@ -7,7 +7,7 @@ from typing import Optional
 
 from .config import AppConfig
 from .db import get_user_by_card, log_auth
-from .security.security import verify_pin
+from .security import verify_pin
 from .camera import CameraParams, capture_frame
 from .bio import compare_biometric
 
