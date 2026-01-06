@@ -1,0 +1,41 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+*.egg-info/
+.eggs/
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Project runtime data (do NOT commit) ----
+data/app.db
+data/*.png
+data/*.jpg
+data/*.jpeg
+data/*.log
+data/logs/
+data/templates/
+data/demo_videos/
+
+# ---- Secrets / local config overrides ----
+*.key
+*.pem
+*.p12
+*.pfx
+*.env
+config.local.yaml
+config.local.yml
+
