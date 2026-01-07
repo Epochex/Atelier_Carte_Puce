@@ -4,7 +4,7 @@ import os
 import time
 import hashlib
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from smartcard.CardType import ATRCardType
 from smartcard.CardRequest import CardRequest
@@ -32,10 +32,6 @@ APP_WORD_LEN = 10
 
 MAGIC = b"CP01"
 
-DEFAULT_CSC0 = b"\xAA\xAA\xAA\xAA"
-DEFAULT_CSC1 = b"\x11\x11\x11\x11"
-DEFAULT_CSC2 = b"\x22\x22\x22\x22"
-
 VERIFY_TARGET_CSC0 = 0x07
 VERIFY_TARGET_CSC1 = 0x39
 VERIFY_TARGET_CSC2 = 0x3B
@@ -47,8 +43,41 @@ def _sha256(b: bytes) -> bytes:
 
 def _chunks4(b: bytes):
     if len(b) % 4 != 0:
-        raise CardError("record length not multiple of 4")
-    return [b[i:i + 4] for i in range(0, len(b), 4)]
+        raise CardError("record_length_not_multiple_of_4")
+    return [b[i : i + 4] for i in range(0, len(b), 4)]
+
+
+def _env_code4(name: str) -> Optional[bytes]:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return None
+    v = v.lower().replace("0x", "").replace(" ", "")
+    try:
+        b = bytes.fromhex(v)
+    except ValueError:
+        raise CardError(f"bad_env_hex:{name}")
+    if len(b) != 4:
+        raise CardError(f"bad_env_len:{name}")
+    return b
+
+
+def _candidate_codes() -> List[bytes]:
+    out: List[bytes] = []
+    for k in ["CARTEPUCE_CSC1_HEX", "CARTEPUCE_CSC0_HEX", "CARTEPUCE_CSC2_HEX"]:
+        b = _env_code4(k)
+        if b:
+            out.append(b)
+    common = [
+        b"\x11\x11\x11\x11",
+        b"\x22\x22\x22\x22",
+        b"\xAA\xAA\xAA\xAA",
+        b"\x00\x00\x00\x00",
+        b"\xFF\xFF\xFF\xFF",
+    ]
+    for c in common:
+        if c not in out:
+            out.append(c)
+    return out
 
 
 @dataclass
@@ -92,7 +121,7 @@ class CardSession:
             except Exception as e:
                 last = e
                 time.sleep(0.2)
-        raise CardError(f"reacquire_failed: {last}")
+        raise CardError(f"reacquire_failed:{last}")
 
     def _transmit(self, apdu) -> Tuple[bytes, int, int]:
         try:
@@ -162,16 +191,18 @@ class CardSession:
         return MAGIC + card_uid16 + user_hash8 + tpl_hash8 + tail
 
     def _try_unlock_user1(self) -> None:
-        for t, c in [
-            (VERIFY_TARGET_CSC1, DEFAULT_CSC1),
-            (VERIFY_TARGET_CSC0, DEFAULT_CSC0),
-            (VERIFY_TARGET_CSC2, DEFAULT_CSC2),
-        ]:
-            try:
-                self.verify(t, c)
-                return
-            except Exception:
-                continue
+        codes = _candidate_codes()
+        targets = [VERIFY_TARGET_CSC1, VERIFY_TARGET_CSC0, VERIFY_TARGET_CSC2]
+        last_err = None
+        for t in targets:
+            for c in codes:
+                try:
+                    self.verify(t, c)
+                    return
+                except Exception as e:
+                    last_err = e
+                    continue
+        raise CardError(f"unlock_failed:{last_err}")
 
     def write_app_record(self, user_id: str, tpl_sha256_hex: str, card_uid16: Optional[bytes] = None) -> str:
         if card_uid16 is None:
@@ -188,9 +219,18 @@ class CardSession:
 
     def provision_or_load_uid(self, user_id: str, tpl_sha256_hex: str) -> Tuple[str, bool]:
         r = self.read_app_record()
-        if r is not None:
+        expected_user_hash8 = _sha256(user_id.encode("utf-8"))[:8].hex()
+        expected_tpl_hash8 = bytes.fromhex(tpl_sha256_hex)[:8].hex()
+
+        if r is None:
+            uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=None)
+            return uid, True
+
+        if (r.user_hash8.lower() == expected_user_hash8.lower()) and (r.tpl_hash8.lower() == expected_tpl_hash8.lower()):
             return r.card_uid, False
-        uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=None)
+
+        uid16 = bytes.fromhex(r.card_uid)
+        uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=uid16)
         return uid, True
 
     def get_uid(self) -> Optional[str]:

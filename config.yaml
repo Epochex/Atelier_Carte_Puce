@@ -1,4 +1,4 @@
-db_path: "data/app.db"
+db_path: data/app.db
 
 camera:
   index: 0
@@ -15,4 +15,10 @@ biometric:
   orb_nfeatures: 800
 
 auth:
-  max_pin_attempts: 1
+  required_factors: 2
+  max_pin_attempts: 3
+  lockout_seconds: 20
+  # Enforce mandatory binding validation between “Card ↔ User ↔ Template”
+  enforce_card_binding: true
+  # Enforce integrity verification of biological template files (hash/HMAC) to prevent offline tampering or replacement.
+  enforce_template_integrity: true

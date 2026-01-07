@@ -21,7 +21,11 @@ class BiometricConfig:
 
 @dataclass
 class AuthConfig:
-    max_pin_attempts: int = 1
+    required_factors: int = 3
+    max_pin_attempts: int = 5
+    lockout_seconds: int = 300
+    enforce_card_binding: bool = True
+    enforce_template_integrity: bool = True
 
 
 @dataclass
@@ -41,7 +45,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     auth = raw.get("auth", {}) or {}
 
     return AppConfig(
-        db_path=raw.get("db_path", "data/app.db"),
+        db_path=str(raw.get("db_path", "data/app.db")),
         camera=CameraConfig(
             index=int(cam.get("index", 0)),
             warmup_frames=int(cam.get("warmup_frames", 10)),
@@ -54,6 +58,10 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             orb_nfeatures=int(bio.get("orb_nfeatures", 800)),
         ),
         auth=AuthConfig(
-            max_pin_attempts=int(auth.get("max_pin_attempts", 1)),
+            required_factors=int(auth.get("required_factors", 3)),
+            max_pin_attempts=int(auth.get("max_pin_attempts", 5)),
+            lockout_seconds=int(auth.get("lockout_seconds", 300)),
+            enforce_card_binding=bool(auth.get("enforce_card_binding", True)),
+            enforce_template_integrity=bool(auth.get("enforce_template_integrity", True)),
         ),
     )
