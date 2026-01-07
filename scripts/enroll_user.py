@@ -1,6 +1,7 @@
 import os
 import argparse
 import cv2
+import getpass
 
 from src.config import load_config
 from src.db import connect, init_db, upsert_user, upsert_biometric
@@ -19,7 +20,7 @@ def main():
     conn = connect(cfg.db_path)
     init_db(conn)
 
-    pin = input("Enter PIN/mot de passe: ").strip()
+    pin = getpass.getpass("Enter PIN/mot de passe: ").strip()
     if not pin:
         raise SystemExit("PIN empty")
 
@@ -39,12 +40,15 @@ def main():
     tpl_sha = sha256_file(template_path)
 
     s = open_card(10)
-    card_uid, wrote = s.provision_or_load_uid(user_id=args.user_id, tpl_sha256_hex=tpl_sha)
+    card_uid, wrote = s.provision_or_load_uid(
+        user_id=args.user_id,
+        tpl_sha256_hex=tpl_sha,
+    )
 
     print(f"[card] card_id={card_uid} atr={s.atr_hex}")
     print(f"[card] write_app_record={wrote}")
 
-    upsert_user(conn, args.user_id, card_uid, salt, ph)
+    upsert_user(conn, args.user_id, card_uid, salt, ph, card_atr=s.atr_hex)
     upsert_biometric(conn, args.user_id, template_path, tpl_sha, algo="ORB+facecrop")
 
     print(f"ENROLL OK: user_id={args.user_id}, template={template_path}")

@@ -5,17 +5,19 @@ CartePuce/
 ├── config.yaml
 ├── data/
   ├── app.db
-  ├── camera_test.png
   ├── templates/
-    ├── alice.png
     ├── lin.png
+    ├── lin1.png
 ├── get_code.py
 ├── requirements.txt
 ├── scripts/
   ├── __init__.py
+  ├── change_pin.py
   ├── demo_run.py
   ├── enroll_user.py
   ├── init_db.py
+  ├── recover_pin.py
+  ├── security_demo.py
   ├── test_camera.py
   ├── test_card.py
 ├── src/
@@ -116,6 +118,67 @@ FILE: scripts/__init__.py
 
 
 
+FILE: scripts/change_pin.py
+
+import argparse
+import time
+
+from src.config import load_config
+from src.db import connect, init_db, get_user_by_card, get_user_by_id, update_user_pin, is_locked, record_pin_failure, clear_auth_state
+from src.security import verify_pin, pbkdf2_hash_pin
+from src.card import open_card
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--user-id", default=None)
+    args = parser.parse_args()
+
+    cfg = load_config("config.yaml")
+    conn = connect(cfg.db_path)
+    init_db(conn)
+
+    if args.user_id:
+        user = get_user_by_id(conn, args.user_id)
+        if not user:
+            raise SystemExit("unknown_user")
+        card_id = user["card_id"]
+    else:
+        s = open_card(10)
+        card_id = s.get_uid()
+        if not card_id:
+            raise SystemExit("no_card")
+        user = get_user_by_card(conn, card_id)
+        if not user:
+            raise SystemExit("unknown_card")
+
+    user_id = user["user_id"]
+    now = int(time.time())
+    locked, _ = is_locked(conn, user_id, now_epoch=now)
+    if locked:
+        raise SystemExit("locked_out")
+
+    old_pin = input("Enter current PIN/mot de passe: ").strip()
+    if not verify_pin(old_pin, user["pwd_salt"], user["pwd_hash"]):
+        record_pin_failure(conn, user_id, now_epoch=now, max_attempts=cfg.auth.max_pin_attempts, lockout_seconds=cfg.auth.lockout_seconds)
+        raise SystemExit("bad_pin")
+
+    new_pin1 = input("Enter new PIN/mot de passe: ").strip()
+    new_pin2 = input("Re-enter new PIN/mot de passe: ").strip()
+    if not new_pin1 or new_pin1 != new_pin2:
+        raise SystemExit("pin_mismatch")
+
+    salt, ph = pbkdf2_hash_pin(new_pin1)
+    update_user_pin(conn, user_id, salt, ph)
+    clear_auth_state(conn, user_id)
+
+    print(f"PIN updated: user_id={user_id} card_id={card_id}")
+
+
+if __name__ == "__main__":
+    main()
+
+
 FILE: scripts/demo_run.py
 
 from src.config import load_config
@@ -135,14 +198,29 @@ def main():
         print("DENY  user=None bio_score=None reason=unknown_card")
         return
 
+    rec = s.read_app_record()
+    user_hash8 = rec.user_hash8 if rec else None
+    tpl_hash8 = rec.tpl_hash8 if rec else None
+
     print(f"[card] detected card_id={card_uid} atr={s.atr_hex}")
 
     pin = input("Enter PIN/mot de passe: ").strip()
 
-    result = run_auth_flow(cfg, conn, card_id=card_uid, card_atr=s.atr_hex, pin=pin)
+    result = run_auth_flow(
+        cfg,
+        conn,
+        card_id=card_uid,
+        card_atr=s.atr_hex,
+        pin=pin,
+        card_user_hash8=user_hash8,
+        card_tpl_hash8=tpl_hash8,
+    )
 
     if result.decision == "ALLOW":
-        print(f"ALLOW user={result.user_id} bio_score={result.bio_score:.3f} reason={result.reason}")
+        if result.bio_score is None:
+            print(f"ALLOW user={result.user_id} bio_score=None reason={result.reason}")
+        else:
+            print(f"ALLOW user={result.user_id} bio_score={result.bio_score:.3f} reason={result.reason}")
     else:
         print(f"DENY  user={result.user_id} bio_score={result.bio_score} reason={result.reason}")
 
@@ -199,7 +277,7 @@ def main():
     print(f"[card] card_id={card_uid} atr={s.atr_hex}")
     print(f"[card] write_app_record={wrote}")
 
-    upsert_user(conn, args.user_id, card_uid, salt, ph)
+    upsert_user(conn, args.user_id, card_uid, salt, ph, card_atr=s.atr_hex)
     upsert_biometric(conn, args.user_id, template_path, tpl_sha, algo="ORB+facecrop")
 
     print(f"ENROLL OK: user_id={args.user_id}, template={template_path}")
@@ -222,6 +300,303 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+FILE: scripts/recover_pin.py
+
+import hashlib
+
+from src.config import load_config
+from src.db import connect, init_db, get_user_by_card, update_user_pin, clear_auth_state, log_auth
+from src.security import pbkdf2_hash_pin, verify_file_sha256
+from src.camera import CameraParams, capture_frame
+from src.bio import compare_biometric
+from src.card import open_card
+
+
+def _sha256_8_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).digest()[:8].hex()
+
+
+def _tpl_hash8_from_sha256_hex(sha256_hex: str):
+    h = (sha256_hex or "").strip().lower()
+    if len(h) != 64:
+        return None
+    try:
+        return bytes.fromhex(h)[:8].hex()
+    except ValueError:
+        return None
+
+
+def main():
+    cfg = load_config("config.yaml")
+    conn = connect(cfg.db_path)
+    init_db(conn)
+
+    s = open_card(10)
+    card_id = s.get_uid()
+    if not card_id:
+        raise SystemExit("no_card")
+
+    rec = s.read_app_record()
+    if not rec:
+        log_auth(conn, card_id, s.atr_hex, None, False, None, "DENY", "card_binding_missing")
+        raise SystemExit("card_binding_missing")
+
+    user = get_user_by_card(conn, card_id)
+    if not user:
+        log_auth(conn, card_id, s.atr_hex, None, False, None, "DENY", "unknown_card")
+        raise SystemExit("unknown_card")
+
+    user_id = user["user_id"]
+    template_path = user.get("template_path")
+    template_sha256 = user.get("template_sha256")
+
+    if cfg.auth.enforce_template_integrity:
+        if not template_path or not template_sha256 or not verify_file_sha256(template_path, template_sha256):
+            log_auth(conn, card_id, s.atr_hex, user_id, False, None, "DENY", "template_tampered")
+            raise SystemExit("template_tampered")
+
+    if cfg.auth.enforce_card_binding:
+        expected_user_hash8 = _sha256_8_hex(user_id)
+        expected_tpl_hash8 = _tpl_hash8_from_sha256_hex(template_sha256) if template_sha256 else None
+        if rec.user_hash8.lower() != expected_user_hash8:
+            log_auth(conn, card_id, s.atr_hex, user_id, False, None, "DENY", "card_user_binding_mismatch")
+            raise SystemExit("card_user_binding_mismatch")
+        if expected_tpl_hash8 is None or rec.tpl_hash8.lower() != expected_tpl_hash8:
+            log_auth(conn, card_id, s.atr_hex, user_id, False, None, "DENY", "card_template_binding_mismatch")
+            raise SystemExit("card_template_binding_mismatch")
+
+    frame = capture_frame(CameraParams(
+        index=cfg.camera.index,
+        warmup_frames=cfg.camera.warmup_frames,
+        width=cfg.camera.width,
+        height=cfg.camera.height,
+    ))
+
+    import cv2
+    template = cv2.imread(template_path) if template_path else None
+    if template is None:
+        log_auth(conn, card_id, s.atr_hex, user_id, False, None, "DENY", "template_read_error")
+        raise SystemExit("template_read_error")
+
+    score = compare_biometric(
+        captured_bgr=frame,
+        template_bgr=template,
+        use_face_crop=cfg.biometric.use_face_crop,
+        nfeatures=cfg.biometric.orb_nfeatures,
+    )
+
+    if score < cfg.biometric.score_threshold:
+        log_auth(conn, card_id, s.atr_hex, user_id, False, score, "DENY", "biometric_mismatch")
+        raise SystemExit("biometric_mismatch")
+
+    new_pin1 = input("Enter new PIN/mot de passe: ").strip()
+    new_pin2 = input("Re-enter new PIN/mot de passe: ").strip()
+    if not new_pin1 or new_pin1 != new_pin2:
+        log_auth(conn, card_id, s.atr_hex, user_id, False, score, "DENY", "pin_mismatch")
+        raise SystemExit("pin_mismatch")
+
+    salt, ph = pbkdf2_hash_pin(new_pin1)
+    update_user_pin(conn, user_id, salt, ph)
+    clear_auth_state(conn, user_id)
+    log_auth(conn, card_id, s.atr_hex, user_id, True, score, "ALLOW", "pin_recovered")
+
+    print(f"PIN recovered: user_id={user_id} card_id={card_id} bio_score={score:.3f}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+FILE: scripts/security_demo.py
+
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import sqlite3
+import sys
+import time
+
+from src.config import load_config
+from src.db import connect, init_db, upsert_user, upsert_biometric, log_auth, get_user_by_card
+from src.security import (
+    pbkdf2_hash_pin,
+    verify_pin,
+    NonceReplayProtector,
+    generate_nonce,
+    new_card_key,
+    key_id_from_key,
+    build_hmac_message,
+    compute_hmac_tag,
+    verify_hmac_tag,
+    sha256_file_hex,
+    verify_file_sha256,
+    build_audit_context,
+    encode_audit_context,
+    compact_reason,
+)
+
+
+def _print(title: str) -> None:
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+
+
+def _ensure_template(path: str) -> None:
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Create a deterministic dummy template file (not an actual face)
+    with open(path, "wb") as f:
+        f.write(b"DEMO_TEMPLATE_V1\n" + b"\x00" * 1024)
+
+
+def demo_password_hashing() -> None:
+    _print("1) Password hashing demo (PBKDF2 + optional pepper compatibility)")
+
+    pin = "1234"
+    salt, h = pbkdf2_hash_pin(pin)
+    ok = verify_pin(pin, salt, h)
+    bad = verify_pin("9999", salt, h)
+    print(f"verify_pin(correct) = {ok} (expected True)")
+    print(f"verify_pin(wrong)   = {bad} (expected False)")
+
+    print("\n[pepper] If you set CARTEPUCE_PASSWORD_PEPPER and re-run, verify_pin remains backward-compatible.")
+    print("Example:")
+    print('  export CARTEPUCE_PASSWORD_PEPPER="my-pepper"')
+    print("  python3 scripts/security_demo.py --only password")
+
+
+def demo_template_integrity(tmp_path: str) -> None:
+    _print("2) Template integrity demo (detect template replacement)")
+
+    _ensure_template(tmp_path)
+    expected = sha256_file_hex(tmp_path)
+    ok = verify_file_sha256(tmp_path, expected)
+    print(f"verify_file_sha256(original) = {ok} (expected True)")
+
+    # Tamper file
+    with open(tmp_path, "ab") as f:
+        f.write(b"\nTAMPER\n")
+
+    bad = verify_file_sha256(tmp_path, expected)
+    print(f"verify_file_sha256(tampered)  = {bad} (expected False)")
+
+
+def demo_replay_protection(card_id: str) -> None:
+    _print("3) Replay protection demo (nonce re-use detection)")
+
+    rp = NonceReplayProtector(ttl_seconds=30, max_entries=128)
+    nonce = generate_nonce(16)
+
+    d1 = rp.check_and_remember(card_id, nonce)
+    d2 = rp.check_and_remember(card_id, nonce)  # replay immediately
+    print(f"first use : ok={d1.ok}, reason={d1.reason} (expected ok)")
+    print(f"replay    : ok={d2.ok}, reason={d2.reason} (expected replay_nonce_seen)")
+
+    print("\n(wait TTL expiration demo)")
+    time.sleep(2)
+    print("You can re-run with shorter TTL to show expiry behavior if needed.")
+
+
+def demo_hmac_challenge_response(card_id: str) -> None:
+    _print("4) HMAC challenge-response demo (host-side secret, constant-time verify)")
+
+    k_card = new_card_key(32)
+    key_id = key_id_from_key(k_card)
+    nonce = generate_nonce(16)
+    counter = 1
+    context = "demo-login@terminal-1"
+
+    msg = build_hmac_message(card_id, nonce, counter, context)
+    tag = compute_hmac_tag(k_card, msg, tag_len=16)
+
+    ok = verify_hmac_tag(k_card, msg, tag)
+    print(f"key_id={key_id}")
+    print(f"tag(ok)={ok} (expected True)")
+
+    # Attack: modify nonce or context
+    msg2 = build_hmac_message(card_id, generate_nonce(16), counter, context)
+    bad = verify_hmac_tag(k_card, msg2, tag)
+    print(f"tag(after message change)={bad} (expected False)")
+
+    # Show audit context packing
+    ctx = build_audit_context(nonce=nonce, counter=counter, key_id=key_id, tag=tag, context=context)
+    ctx_json = encode_audit_context(ctx)
+    reason = compact_reason("hmac_demo", ctx_json)
+    print(f"audit_reason_field_example:\n  {reason}")
+
+
+def demo_auth_logs(db_path: str) -> None:
+    _print("5) Audit log demo (write synthetic auth logs + query)")
+
+    conn = connect(db_path)
+    init_db(conn)
+
+    # synthetic log entries
+    log_auth(conn, "deadbeef" * 4, "3B 02 53 01", "alice", True, 0.42, "ALLOW", "ok")
+    log_auth(conn, "deadbeef" * 4, "3B 02 53 01", "alice", False, None, "DENY", "bad_pin")
+
+    rows = conn.execute(
+        "SELECT ts, card_id, user_id, pwd_ok, bio_score, decision, reason FROM auth_logs ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+    for r in rows:
+        print(dict(r))
+
+
+def demo_db_offline_attack_model(db_path: str) -> None:
+    _print("6) DB compromise model demo (offline guessing cost + pepper)")
+
+    print("This demo explains the threat model rather than brute-forcing.")
+    print("- pwd_hash is PBKDF2-HMAC-SHA256 with 200k iterations (costly offline).")
+    print("- If CARTEPUCE_PASSWORD_PEPPER is set, DB-only compromise is insufficient to verify guesses.")
+    print(f"DB path: {db_path}")
+    print("Check your users table stores only salt/hash, not plaintext.")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Security demo runner for CartePuce project")
+    parser.add_argument("--config", default="config.yaml", help="Config path")
+    parser.add_argument("--template", default="data/templates/demo_template.bin", help="Template file for integrity demo")
+    parser.add_argument("--card-id", default="f22c9c89dce6ca8876dcc20421af84d3", help="Demo card_id (16B hex -> 32 chars)")
+    parser.add_argument(
+        "--only",
+        choices=["password", "template", "replay", "hmac", "logs", "dbmodel", "all"],
+        default="all",
+        help="Run only one section",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+
+    if args.only in ("password", "all"):
+        demo_password_hashing()
+
+    if args.only in ("template", "all"):
+        demo_template_integrity(args.template)
+
+    if args.only in ("replay", "all"):
+        demo_replay_protection(args.card_id)
+
+    if args.only in ("hmac", "all"):
+        demo_hmac_challenge_response(args.card_id)
+
+    if args.only in ("logs", "all"):
+        demo_auth_logs(cfg.db_path)
+
+    if args.only in ("dbmodel", "all"):
+        demo_db_offline_attack_model(cfg.db_path)
+
+    print("\nDONE")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 FILE: scripts/test_camera.py
@@ -324,13 +699,15 @@ FILE: src/auth_flow.py
 from __future__ import annotations
 
 import os
+import time
+import hashlib
 import cv2
 from dataclasses import dataclass
 from typing import Optional
 
 from .config import AppConfig
-from .db import get_user_by_card, log_auth
-from .security import verify_pin
+from .db import get_user_by_card, log_auth, is_locked, record_pin_failure, clear_auth_state
+from .security import verify_pin, verify_file_sha256, build_audit_context, encode_audit_context, compact_reason
 from .camera import CameraParams, capture_frame
 from .bio import compare_biometric
 
@@ -343,18 +720,91 @@ class AuthResult:
     bio_score: Optional[float] = None
 
 
-def run_auth_flow(cfg: AppConfig, conn, card_id: str, pin: str, card_atr: Optional[str] = None) -> AuthResult:
+def _sha256_8_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).digest()[:8].hex()
+
+
+def _tpl_hash8_from_sha256_hex(sha256_hex: str) -> Optional[str]:
+    h = (sha256_hex or "").strip().lower()
+    if len(h) != 64:
+        return None
+    try:
+        return bytes.fromhex(h)[:8].hex()
+    except ValueError:
+        return None
+
+
+def _ctx(**kwargs):
+    return encode_audit_context(build_audit_context(extra=kwargs))
+
+
+def run_auth_flow(
+    cfg: AppConfig,
+    conn,
+    card_id: str,
+    pin: str,
+    card_atr: Optional[str] = None,
+    card_user_hash8: Optional[str] = None,
+    card_tpl_hash8: Optional[str] = None,
+) -> AuthResult:
     user = get_user_by_card(conn, card_id)
     if not user:
-        log_auth(conn, card_id, card_atr, None, False, None, "DENY", "unknown_card")
+        log_auth(conn, card_id, card_atr, None, False, None, "DENY", compact_reason("unknown_card", _ctx(card_id=card_id)))
         return AuthResult(decision="DENY", reason="unknown_card")
 
     user_id = user["user_id"]
 
+    now_epoch = int(time.time())
+    locked, locked_until = is_locked(conn, user_id, now_epoch=now_epoch)
+    if locked:
+        log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", compact_reason("locked_out", _ctx(card_id=card_id, user_id=user_id, locked_until_epoch=locked_until)))
+        return AuthResult(decision="DENY", reason="locked_out", user_id=user_id)
+
+    template_path = user.get("template_path")
+    template_sha256 = user.get("template_sha256")
+
+    if cfg.auth.enforce_template_integrity:
+        if not template_path or not template_sha256:
+            log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", compact_reason("no_biometric_template", _ctx(card_id=card_id, user_id=user_id)))
+            return AuthResult(decision="DENY", reason="no_biometric_template", user_id=user_id)
+
+        if not verify_file_sha256(template_path, template_sha256):
+            log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", compact_reason("template_tampered", _ctx(card_id=card_id, user_id=user_id, template_path=template_path)))
+            return AuthResult(decision="DENY", reason="template_tampered", user_id=user_id)
+
+    if cfg.auth.enforce_card_binding:
+        if not card_user_hash8 or not card_tpl_hash8:
+            log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", compact_reason("card_binding_missing", _ctx(card_id=card_id, user_id=user_id)))
+            return AuthResult(decision="DENY", reason="card_binding_missing", user_id=user_id)
+
+        expected_user_hash8 = _sha256_8_hex(user_id)
+        expected_tpl_hash8 = _tpl_hash8_from_sha256_hex(template_sha256) if template_sha256 else None
+
+        cu = (card_user_hash8 or "").strip().lower()
+        ct = (card_tpl_hash8 or "").strip().lower()
+
+        if cu != expected_user_hash8:
+            log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", compact_reason("card_user_binding_mismatch", _ctx(card_id=card_id, user_id=user_id, expected=expected_user_hash8, got=cu)))
+            return AuthResult(decision="DENY", reason="card_user_binding_mismatch", user_id=user_id)
+
+        if expected_tpl_hash8 is None or ct != expected_tpl_hash8:
+            log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", compact_reason("card_template_binding_mismatch", _ctx(card_id=card_id, user_id=user_id, expected=expected_tpl_hash8, got=ct)))
+            return AuthResult(decision="DENY", reason="card_template_binding_mismatch", user_id=user_id)
+
     pwd_ok = verify_pin(pin, user["pwd_salt"], user["pwd_hash"])
     if not pwd_ok:
-        log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", "bad_pin")
+        st = record_pin_failure(conn, user_id, now_epoch=now_epoch, max_attempts=cfg.auth.max_pin_attempts, lockout_seconds=cfg.auth.lockout_seconds)
+        if st.get("locked_until_epoch") and int(st["locked_until_epoch"]) > now_epoch:
+            log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", compact_reason("locked_out", _ctx(card_id=card_id, user_id=user_id, locked_until_epoch=st["locked_until_epoch"], fail_count=st["fail_count"])))
+            return AuthResult(decision="DENY", reason="locked_out", user_id=user_id)
+        log_auth(conn, card_id, card_atr, user_id, False, None, "DENY", compact_reason("bad_pin", _ctx(card_id=card_id, user_id=user_id, fail_count=st["fail_count"])))
         return AuthResult(decision="DENY", reason="bad_pin", user_id=user_id)
+
+    clear_auth_state(conn, user_id)
+
+    if int(cfg.auth.required_factors) <= 2:
+        log_auth(conn, card_id, card_atr, user_id, True, None, "ALLOW", compact_reason("ok_2fa", _ctx(card_id=card_id, user_id=user_id)))
+        return AuthResult(decision="ALLOW", reason="ok_2fa", user_id=user_id, bio_score=None)
 
     frame = capture_frame(CameraParams(
         index=cfg.camera.index,
@@ -363,14 +813,13 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, pin: str, card_atr: Option
         height=cfg.camera.height,
     ))
 
-    template_path = user.get("template_path")
-    if not template_path or not os.path.exists(template_path):
-        log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "no_biometric_template")
-        return AuthResult(decision="DENY", reason="no_biometric_template", user_id=user_id)
+    if template_path and os.path.exists(template_path):
+        template = cv2.imread(template_path)
+    else:
+        template = None
 
-    template = cv2.imread(template_path)
     if template is None:
-        log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", "template_read_error")
+        log_auth(conn, card_id, card_atr, user_id, True, None, "DENY", compact_reason("template_read_error", _ctx(card_id=card_id, user_id=user_id, template_path=template_path)))
         return AuthResult(decision="DENY", reason="template_read_error", user_id=user_id)
 
     score = compare_biometric(
@@ -381,10 +830,10 @@ def run_auth_flow(cfg: AppConfig, conn, card_id: str, pin: str, card_atr: Option
     )
 
     if score >= cfg.biometric.score_threshold:
-        log_auth(conn, card_id, card_atr, user_id, True, score, "ALLOW", "ok")
+        log_auth(conn, card_id, card_atr, user_id, True, score, "ALLOW", compact_reason("ok", _ctx(card_id=card_id, user_id=user_id, bio_score=score)))
         return AuthResult(decision="ALLOW", reason="ok", user_id=user_id, bio_score=score)
 
-    log_auth(conn, card_id, card_atr, user_id, True, score, "DENY", "biometric_mismatch")
+    log_auth(conn, card_id, card_atr, user_id, True, score, "DENY", compact_reason("biometric_mismatch", _ctx(card_id=card_id, user_id=user_id, bio_score=score)))
     return AuthResult(decision="DENY", reason="biometric_mismatch", user_id=user_id, bio_score=score)
 
 
@@ -518,7 +967,7 @@ import os
 import time
 import hashlib
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from smartcard.CardType import ATRCardType
 from smartcard.CardRequest import CardRequest
@@ -534,9 +983,9 @@ GCM_ATR = [0x3B, 0x02, 0x53, 0x01]
 GCM_ATR_MASK = [0xFF, 0xFF, 0xFF, 0x00]
 GCM_CARD_TYPE = ATRCardType(GCM_ATR, GCM_ATR_MASK)
 
-INS_READ = 0xBE  # read 4 bytes from an addr
-INS_UPDATE = 0xDE  # write 4 bytes to an addr
-INS_VERIFY = 0x20  # verify code on card
+INS_READ = 0xBE
+INS_UPDATE = 0xDE
+INS_VERIFY = 0x20
 
 ADDR_ISSUER_BASE = 0x01
 ADDR_USER1_BASE = 0x10
@@ -545,10 +994,6 @@ APP_WORD_BASE = ADDR_USER1_BASE
 APP_WORD_LEN = 10
 
 MAGIC = b"CP01"
-
-DEFAULT_CSC0 = b"\xAA\xAA\xAA\xAA"
-DEFAULT_CSC1 = b"\x11\x11\x11\x11"
-DEFAULT_CSC2 = b"\x22\x22\x22\x22"
 
 VERIFY_TARGET_CSC0 = 0x07
 VERIFY_TARGET_CSC1 = 0x39
@@ -561,8 +1006,41 @@ def _sha256(b: bytes) -> bytes:
 
 def _chunks4(b: bytes):
     if len(b) % 4 != 0:
-        raise CardError("record length not multiple of 4")
-    return [b[i:i + 4] for i in range(0, len(b), 4)]
+        raise CardError("record_length_not_multiple_of_4")
+    return [b[i : i + 4] for i in range(0, len(b), 4)]
+
+
+def _env_code4(name: str) -> Optional[bytes]:
+    v = os.getenv(name, "").strip()
+    if not v:
+        return None
+    v = v.lower().replace("0x", "").replace(" ", "")
+    try:
+        b = bytes.fromhex(v)
+    except ValueError:
+        raise CardError(f"bad_env_hex:{name}")
+    if len(b) != 4:
+        raise CardError(f"bad_env_len:{name}")
+    return b
+
+
+def _candidate_codes() -> List[bytes]:
+    out: List[bytes] = []
+    for k in ["CARTEPUCE_CSC1_HEX", "CARTEPUCE_CSC0_HEX", "CARTEPUCE_CSC2_HEX"]:
+        b = _env_code4(k)
+        if b:
+            out.append(b)
+    common = [
+        b"\x11\x11\x11\x11",
+        b"\x22\x22\x22\x22",
+        b"\xAA\xAA\xAA\xAA",
+        b"\x00\x00\x00\x00",
+        b"\xFF\xFF\xFF\xFF",
+    ]
+    for c in common:
+        if c not in out:
+            out.append(c)
+    return out
 
 
 @dataclass
@@ -606,7 +1084,7 @@ class CardSession:
             except Exception as e:
                 last = e
                 time.sleep(0.2)
-        raise CardError(f"reacquire_failed: {last}")
+        raise CardError(f"reacquire_failed:{last}")
 
     def _transmit(self, apdu) -> Tuple[bytes, int, int]:
         try:
@@ -676,16 +1154,18 @@ class CardSession:
         return MAGIC + card_uid16 + user_hash8 + tpl_hash8 + tail
 
     def _try_unlock_user1(self) -> None:
-        for t, c in [
-            (VERIFY_TARGET_CSC1, DEFAULT_CSC1),
-            (VERIFY_TARGET_CSC0, DEFAULT_CSC0),
-            (VERIFY_TARGET_CSC2, DEFAULT_CSC2),
-        ]:
-            try:
-                self.verify(t, c)
-                return
-            except Exception:
-                continue
+        codes = _candidate_codes()
+        targets = [VERIFY_TARGET_CSC1, VERIFY_TARGET_CSC0, VERIFY_TARGET_CSC2]
+        last_err = None
+        for t in targets:
+            for c in codes:
+                try:
+                    self.verify(t, c)
+                    return
+                except Exception as e:
+                    last_err = e
+                    continue
+        raise CardError(f"unlock_failed:{last_err}")
 
     def write_app_record(self, user_id: str, tpl_sha256_hex: str, card_uid16: Optional[bytes] = None) -> str:
         if card_uid16 is None:
@@ -702,38 +1182,23 @@ class CardSession:
 
     def provision_or_load_uid(self, user_id: str, tpl_sha256_hex: str) -> Tuple[str, bool]:
         r = self.read_app_record()
-        if r is not None:
+        expected_user_hash8 = _sha256(user_id.encode("utf-8"))[:8].hex()
+        expected_tpl_hash8 = bytes.fromhex(tpl_sha256_hex)[:8].hex()
+
+        if r is None:
+            uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=None)
+            return uid, True
+
+        if (r.user_hash8.lower() == expected_user_hash8.lower()) and (r.tpl_hash8.lower() == expected_tpl_hash8.lower()):
             return r.card_uid, False
-        uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=None)
+
+        uid16 = bytes.fromhex(r.card_uid)
+        uid = self.write_app_record(user_id=user_id, tpl_sha256_hex=tpl_sha256_hex, card_uid16=uid16)
         return uid, True
 
     def get_uid(self) -> Optional[str]:
         r = self.read_app_record()
         return None if r is None else r.card_uid
-
-    # Backward compatibility for your current workspace (older scripts may still call this)
-    def get_uid_or_none(self) -> Optional[str]:
-        return self.get_uid()
-
-
-@dataclass
-class CardInfo:
-    card_id: Optional[str]
-    atr_hex: Optional[str]
-
-
-def get_card_id(simulate_card=None, timeout_seconds: int = 10) -> CardInfo:
-    """Return CardInfo for the first detected card or simulated info.
-    If a card is not present or an error occurs, returns CardInfo(card_id=None, atr_hex=None).
-    """
-    if simulate_card is not None:
-        # expected format: {'card_id': str, 'atr_hex': str}
-        return CardInfo(card_id=simulate_card.get("card_id"), atr_hex=simulate_card.get("atr_hex"))
-    try:
-        s = CardSession(timeout_seconds=timeout_seconds)
-    except Exception:
-        return CardInfo(card_id=None, atr_hex=None)
-    return CardInfo(card_id=s.get_uid(), atr_hex=s.atr_hex)
 
 
 def open_card(timeout_seconds: int = 10) -> CardSession:
@@ -765,7 +1230,11 @@ class BiometricConfig:
 
 @dataclass
 class AuthConfig:
-    max_pin_attempts: int = 1
+    required_factors: int = 3
+    max_pin_attempts: int = 5
+    lockout_seconds: int = 300
+    enforce_card_binding: bool = True
+    enforce_template_integrity: bool = True
 
 
 @dataclass
@@ -785,7 +1254,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     auth = raw.get("auth", {}) or {}
 
     return AppConfig(
-        db_path=raw.get("db_path", "data/app.db"),
+        db_path=str(raw.get("db_path", "data/app.db")),
         camera=CameraConfig(
             index=int(cam.get("index", 0)),
             warmup_frames=int(cam.get("warmup_frames", 10)),
@@ -798,7 +1267,11 @@ def load_config(path: str = "config.yaml") -> AppConfig:
             orb_nfeatures=int(bio.get("orb_nfeatures", 800)),
         ),
         auth=AuthConfig(
-            max_pin_attempts=int(auth.get("max_pin_attempts", 1)),
+            required_factors=int(auth.get("required_factors", 3)),
+            max_pin_attempts=int(auth.get("max_pin_attempts", 5)),
+            lockout_seconds=int(auth.get("lockout_seconds", 300)),
+            enforce_card_binding=bool(auth.get("enforce_card_binding", True)),
+            enforce_template_integrity=bool(auth.get("enforce_template_integrity", True)),
         ),
     )
 
@@ -809,7 +1282,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from typing import Optional, Any, Dict
+import time
+from typing import Optional, Any, Dict, Tuple
+
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -829,6 +1304,15 @@ CREATE TABLE IF NOT EXISTS biometrics (
   template_sha256 TEXT NOT NULL,
   algo            TEXT NOT NULL,
   created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS auth_state (
+  user_id            TEXT PRIMARY KEY,
+  fail_count         INTEGER NOT NULL DEFAULT 0,
+  locked_until_epoch INTEGER,
+  last_fail_epoch    INTEGER,
+  updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
 
@@ -856,6 +1340,7 @@ def connect(db_path: str) -> sqlite3.Connection:
     ensure_parent_dir(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 
@@ -869,7 +1354,6 @@ def _ensure_column(conn: sqlite3.Connection, table: str, col: str, ddl: str) -> 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     conn.commit()
-
     _ensure_column(conn, "users", "card_atr", "card_atr TEXT")
     _ensure_column(conn, "auth_logs", "card_atr", "card_atr TEXT")
 
@@ -893,6 +1377,16 @@ def upsert_user(
           pwd_hash=excluded.pwd_hash
         """,
         (user_id, card_id, card_atr, pwd_salt, pwd_hash),
+    )
+    conn.commit()
+
+
+def update_user_pin(conn: sqlite3.Connection, user_id: str, pwd_salt: bytes, pwd_hash: bytes) -> None:
+    conn.execute(
+        """
+        UPDATE users SET pwd_salt=?, pwd_hash=? WHERE user_id=?
+        """,
+        (pwd_salt, pwd_hash, user_id),
     )
     conn.commit()
 
@@ -930,6 +1424,91 @@ def get_user_by_card(conn: sqlite3.Connection, card_id: str) -> Optional[Dict[st
         (card_id,),
     ).fetchone()
     return dict(row) if row else None
+
+
+def get_user_by_id(conn: sqlite3.Connection, user_id: str) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT u.user_id, u.card_id, u.card_atr, u.pwd_salt, u.pwd_hash,
+               b.template_path, b.template_sha256, b.algo
+        FROM users u
+        LEFT JOIN biometrics b ON b.user_id = u.user_id
+        WHERE u.user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _ensure_auth_state(conn: sqlite3.Connection, user_id: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO auth_state(user_id, fail_count, locked_until_epoch, last_fail_epoch)
+        VALUES(?, 0, NULL, NULL)
+        ON CONFLICT(user_id) DO NOTHING
+        """,
+        (user_id,),
+    )
+    conn.commit()
+
+
+def get_auth_state(conn: sqlite3.Connection, user_id: str) -> Dict[str, Any]:
+    _ensure_auth_state(conn, user_id)
+    row = conn.execute(
+        """
+        SELECT user_id, fail_count, locked_until_epoch, last_fail_epoch
+        FROM auth_state WHERE user_id=?
+        """,
+        (user_id,),
+    ).fetchone()
+    return dict(row) if row else {"user_id": user_id, "fail_count": 0, "locked_until_epoch": None, "last_fail_epoch": None}
+
+
+def is_locked(conn: sqlite3.Connection, user_id: str, now_epoch: Optional[int] = None) -> Tuple[bool, Optional[int]]:
+    st = get_auth_state(conn, user_id)
+    locked_until = st.get("locked_until_epoch")
+    if locked_until is None:
+        return False, None
+    if now_epoch is None:
+        now_epoch = int(time.time())
+    return now_epoch < int(locked_until), int(locked_until)
+
+
+def record_pin_failure(
+    conn: sqlite3.Connection,
+    user_id: str,
+    now_epoch: int,
+    max_attempts: int,
+    lockout_seconds: int,
+) -> Dict[str, Any]:
+    st = get_auth_state(conn, user_id)
+    fail_count = int(st.get("fail_count") or 0) + 1
+    locked_until = st.get("locked_until_epoch")
+    if max_attempts > 0 and fail_count >= max_attempts:
+        locked_until = int(now_epoch + max(1, lockout_seconds))
+    conn.execute(
+        """
+        UPDATE auth_state
+        SET fail_count=?, locked_until_epoch=?, last_fail_epoch=?, updated_at=datetime('now')
+        WHERE user_id=?
+        """,
+        (fail_count, locked_until, int(now_epoch), user_id),
+    )
+    conn.commit()
+    return {"user_id": user_id, "fail_count": fail_count, "locked_until_epoch": locked_until}
+
+
+def clear_auth_state(conn: sqlite3.Connection, user_id: str) -> None:
+    _ensure_auth_state(conn, user_id)
+    conn.execute(
+        """
+        UPDATE auth_state
+        SET fail_count=0, locked_until_epoch=NULL, last_fail_epoch=NULL, updated_at=datetime('now')
+        WHERE user_id=?
+        """,
+        (user_id,),
+    )
+    conn.commit()
 
 
 def log_auth(

@@ -1,4 +1,4 @@
-db_path: "data/app.db"
+db_path: data/app.db
 
 camera:
   index: 0
@@ -7,12 +7,15 @@ camera:
   height: 480
 
 biometric:
-  # ORB 匹配分数阈值（0~1）。越高越严格
   score_threshold: 0.18
-  # 是否尝试人脸裁剪（失败则回退到中心裁剪）
   use_face_crop: true
-  # ORB 特征点数
   orb_nfeatures: 800
 
 auth:
-  max_pin_attempts: 1
+  required_factors: 2
+  max_pin_attempts: 3
+  lockout_seconds: 20
+  # Enforce mandatory binding validation between “Card ↔ User ↔ Template”
+  enforce_card_binding: true
+  # Enforce integrity verification of biological template files (hash/HMAC) to prevent offline tampering or replacement.
+  enforce_template_integrity: true
