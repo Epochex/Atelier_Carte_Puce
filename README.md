@@ -9,16 +9,12 @@ This repository implements and validates a multi-factor strong authentication sy
 
 Because GemClub-Memo1 is a pure storage card with no cryptographic capability, the system does NOT rely on the secrecy of card data. Security is enforced through strict cross-layer consistency checks.
 
-==================================================
 1. Environment Initialization
-==================================================
 
 rm -f data/app.db
 python3 -m scripts.init_db
 
-==================================================
 2. Smart Card Read/Write Sanity Check
-==================================================
 
 python3 -m scripts.test_card
 
@@ -26,9 +22,7 @@ Purpose:
 - Ensure the card is detected
 - Verify basic read/write capability
 
-==================================================
 3. User Enrollment (Card + PIN + Biometric)
-==================================================
 
 python3 -m scripts.enroll_user --user-id lin
 
@@ -39,9 +33,7 @@ Enrollment actions:
 - Store SHA-256 in DB
 - Write tpl_hash8 (first 8 bytes of SHA-256) to card
 
-==================================================
 4. Card ↔ Database Consistency Verification
-==================================================
 
 4.1 Inspect card app_record
 
@@ -63,9 +55,7 @@ Requirement:
 - First 8 bytes of template SHA-256 MUST match tpl_hash8 on card
 - Otherwise authentication is denied
 
-==================================================
 5. Two-Factor Authentication (2FA) Validation
-==================================================
 
 Edit config.yaml:
 
@@ -84,9 +74,7 @@ Expected behavior:
 - Repeated wrong PIN triggers temporary lockout
 - Access restored after timeout + correct PIN
 
-==================================================
 6. Audit Log Inspection
-==================================================
 
 sqlite3 data/app.db \
 "SELECT id, ts, card_id, user_id, pwd_ok, bio_score, decision, reason \
@@ -97,9 +85,7 @@ Used to verify:
 - Lockout behavior
 - Tamper detection
 
-==================================================
 7. Biometric Template Tamper Detection
-==================================================
 
 Tamper with template file:
 
@@ -115,9 +101,7 @@ Recovery:
 python3 -m scripts.enroll_user --user-id lin
 python3 -m scripts.demo_run
 
-==================================================
 8. Card Binding Enforcement (Core Security Property)
-==================================================
 
 Authentication strictly enforces the following chain:
 
@@ -131,20 +115,16 @@ Authentication strictly enforces the following chain:
 
 Any mismatch at ANY level results in immediate DENY.
 
-==================================================
 9. Card Binding Attack Scenarios
-==================================================
 
 Attack scenario                          Result without binding     Result with binding
----------------------------------------------------------------------------------------
+-------------------------------------
 Swap card, same user                     Possible bypass            DENIED
 Clone app_record to another card         Possible bypass            DENIED
 DB user mapped to wrong card             Possible bypass            DENIED
 Copy biometric template to another user  Possible bypass            DENIED
 
-==================================================
 10. Threat Model Justification
-==================================================
 
 GemClub-Memo1 characteristics:
 - Storage-only smart card
@@ -166,9 +146,7 @@ Any of the following attacks are detected and rejected:
 - Database rollback
 - Card/user mismatch
 
-==================================================
 11. Card Cloning Attack Demonstration
-==================================================
 
 11.1 Baseline (Legitimate Card A)
 
@@ -199,19 +177,3 @@ Expected result:
 - DENIED
 - Reason: card binding mismatch
 
-==================================================
-12. Security Conclusion
-==================================================
-
-This system demonstrates that strong authentication is achievable even with fully copyable smart cards by:
-
-- Never trusting card data secrecy
-- Enforcing strict card ↔ user ↔ template binding
-- Validating integrity at authentication time
-- Logging all security-relevant events
-
-The design explicitly resists:
-- Card cloning
-- Template replay
-- Database tampering
-- Rollback attacks
