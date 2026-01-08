@@ -10,22 +10,22 @@ This repository implements and validates a multi-factor strong authentication sy
 Because GemClub-Memo1 is a pure storage card with no cryptographic capability, the system does NOT rely on the secrecy of card data. Security is enforced through strict cross-layer consistency checks.
 
 1. Environment Initialization
-
+```shell
 rm -f data/app.db
 python3 -m scripts.init_db
-
+```
 2. Smart Card Read/Write Sanity Check
-
+```shell
 python3 -m scripts.test_card
-
+```
 Purpose:
 - Ensure the card is detected
 - Verify basic read/write capability
 
 3. User Enrollment (Card + PIN + Biometric)
-
+```shell
 python3 -m scripts.enroll_user --user-id lin
-
+```
 Enrollment actions:
 - Enforce PIN policy
 - Capture biometric image
@@ -36,17 +36,17 @@ Enrollment actions:
 4. Card ↔ Database Consistency Verification
 
 4.1 Inspect card app_record
-
+```shell
 python3 -m scripts.test_card
-
+```
 Record:
 - tpl_hash8
 
 4.2 Inspect database record
-
+```shell
 sqlite3 data/app.db \
 "SELECT user_id, template_path, template_sha256 FROM biometrics WHERE user_id='lin';"
-
+```
 4.3 Verify biometric file integrity
 
 sha256sum data/templates/lin.png
@@ -65,9 +65,9 @@ auth:
   lockout_seconds: 60
 
 Run authentication:
-
+```shell
 python3 -m scripts.demo_run
-
+```
 Expected behavior:
 - Card + PIN required
 - Biometric factor disabled
@@ -75,11 +75,11 @@ Expected behavior:
 - Access restored after timeout + correct PIN
 
 6. Audit Log Inspection
-
+```shell
 sqlite3 data/app.db \
 "SELECT id, ts, card_id, user_id, pwd_ok, bio_score, decision, reason \
  FROM auth_logs ORDER BY id DESC LIMIT 15;"
-
+```
 Used to verify:
 - Decision logic
 - Lockout behavior
@@ -88,30 +88,24 @@ Used to verify:
 7. Biometric Template Tamper Detection
 
 Tamper with template file:
-
+```shell
 printf 'X' >> data/templates/lin.png
 python3 -m scripts.demo_run
-
+```
 Expected result:
 - DENIED
 - reason = template_tampered
 
 Recovery:
-
+```shell
 python3 -m scripts.enroll_user --user-id lin
 python3 -m scripts.demo_run
-
+```
 8. Card Binding Enforcement (Core Security Property)
 
 Authentication strictly enforces the following chain:
 
-[ Physical Card UID ]
-        ↓
-[ Card app_record.card_uid ]
-        ↓
-[ Database user.card_uid ]
-        ↓
-[ Biometric template ownership (user_id) ]
+[ Physical Card UID ] -> [ Card app_record.card_uid ] -> [ Database user.card_uid ] -> [ Biometric template ownership (user_id) ]
 
 Any mismatch at ANY level results in immediate DENY.
 
@@ -149,11 +143,11 @@ Any of the following attacks are detected and rejected:
 11. Card Cloning Attack Demonstration
 
 11.1 Baseline (Legitimate Card A)
-
+```shell
 python3 -m scripts.enroll_user --user-id lin
 python3 -m scripts.test_card
 python3 -m scripts.demo_run
-
+```
 Result:
 - Authentication succeeds
 
@@ -162,17 +156,17 @@ Result:
 Remove Card A, insert Card B.
 
 Force enrollment using same user-id and same template:
-
+```shell
 python3 -m scripts.enroll_user --user-id lin
 python3 -m scripts.test_card
-
+```
 Observation:
 - Card B contains identical app_record data
 
 11.3 Attack Attempt
-
+```shell
 python3 -m scripts.demo_run
-
+```
 Expected result:
 - DENIED
 - Reason: card binding mismatch
