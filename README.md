@@ -15,9 +15,9 @@ rm -f data/app.db
 python3 -m scripts.init_db
 ```
 2. Smart Card Read/Write Sanity Check
-
+```shell
 python3 -m scripts.test_card
-
+```
 Purpose:
 - Ensure the card is detected
 - Verify basic read/write capability
