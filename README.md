@@ -105,13 +105,7 @@ python3 -m scripts.demo_run
 
 Authentication strictly enforces the following chain:
 
-[ Physical Card UID ]
-        ↓
-[ Card app_record.card_uid ]
-        ↓
-[ Database user.card_uid ]
-        ↓
-[ Biometric template ownership (user_id) ]
+[ Physical Card UID ] -> [ Card app_record.card_uid ] -> [ Database user.card_uid ] -> [ Biometric template ownership (user_id) ]
 
 Any mismatch at ANY level results in immediate DENY.
 
