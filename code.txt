@@ -122,9 +122,19 @@ FILE: scripts/change_pin.py
 
 import argparse
 import time
+import getpass
 
 from src.config import load_config
-from src.db import connect, init_db, get_user_by_card, get_user_by_id, update_user_pin, is_locked, record_pin_failure, clear_auth_state
+from src.db import (
+    connect,
+    init_db,
+    get_user_by_card,
+    get_user_by_id,
+    update_user_pin,
+    is_locked,
+    record_pin_failure,
+    clear_auth_state,
+)
 from src.security import verify_pin, pbkdf2_hash_pin
 from src.card import open_card
 
@@ -158,21 +168,29 @@ def main():
     if locked:
         raise SystemExit("locked_out")
 
-    old_pin = input("Enter current PIN/mot de passe: ").strip()
+    old_pin = getpass.getpass("Enter current PIN/mot de passe: ").strip()
     if not verify_pin(old_pin, user["pwd_salt"], user["pwd_hash"]):
-        record_pin_failure(conn, user_id, now_epoch=now, max_attempts=cfg.auth.max_pin_attempts, lockout_seconds=cfg.auth.lockout_seconds)
+        record_pin_failure(
+            conn,
+            user_id,
+            now_epoch=now,
+            max_attempts=cfg.auth.max_pin_attempts,
+            lockout_seconds=cfg.auth.lockout_seconds,
+        )
         raise SystemExit("bad_pin")
 
-    new_pin1 = input("Enter new PIN/mot de passe: ").strip()
-    new_pin2 = input("Re-enter new PIN/mot de passe: ").strip()
+    new_pin1 = getpass.getpass("Enter new PIN/mot de passe: ").strip()
+    new_pin2 = getpass.getpass("Confirm new PIN/mot de passe: ").strip()
     if not new_pin1 or new_pin1 != new_pin2:
         raise SystemExit("pin_mismatch")
 
+    # Hash the new PIN and update the database
     salt, ph = pbkdf2_hash_pin(new_pin1)
     update_user_pin(conn, user_id, salt, ph)
+    # Clear any recorded failures so the user isn't locked out after a successful change
     clear_auth_state(conn, user_id)
 
-    print(f"PIN updated: user_id={user_id} card_id={card_id}")
+    print(f"PIN changed: user_id={user_id} card_id={card_id}")
 
 
 if __name__ == "__main__":
@@ -180,6 +198,8 @@ if __name__ == "__main__":
 
 
 FILE: scripts/demo_run.py
+
+import getpass
 
 from src.config import load_config
 from src.db import connect, init_db
@@ -195,16 +215,17 @@ def main():
     s = open_card(10)
     card_uid = s.get_uid()
     if not card_uid:
-        print("DENY  user=None bio_score=None reason=unknown_card")
+        print("[ACCESS DENIED] user=None bio_score=None reason=unknown_card")
         return
 
     rec = s.read_app_record()
     user_hash8 = rec.user_hash8 if rec else None
     tpl_hash8 = rec.tpl_hash8 if rec else None
 
-    print(f"[card] detected card_id={card_uid} atr={s.atr_hex}")
+    print(f"[DETECTED] card_id={card_uid} atr={s.atr_hex}")
 
-    pin = input("Enter PIN/mot de passe: ").strip()
+    pin = getpass.getpass("Enter PIN/mot de passe: ").strip()
+
 
     result = run_auth_flow(
         cfg,
@@ -218,11 +239,11 @@ def main():
 
     if result.decision == "ALLOW":
         if result.bio_score is None:
-            print(f"ALLOW user={result.user_id} bio_score=None reason={result.reason}")
+            print(f"[ACCESS GRANTED] user={result.user_id} bio_score=None reason={result.reason}")
         else:
-            print(f"ALLOW user={result.user_id} bio_score={result.bio_score:.3f} reason={result.reason}")
+            print(f"[ACCESS GRANTED] user={result.user_id} bio_score={result.bio_score:.3f} reason={result.reason}")
     else:
-        print(f"DENY  user={result.user_id} bio_score={result.bio_score} reason={result.reason}")
+        print(f"[ACCESS DENIED] user={result.user_id} bio_score={result.bio_score} reason={result.reason}")
 
 
 if __name__ == "__main__":
@@ -234,6 +255,7 @@ FILE: scripts/enroll_user.py
 import os
 import argparse
 import cv2
+import getpass
 
 from src.config import load_config
 from src.db import connect, init_db, upsert_user, upsert_biometric
@@ -252,7 +274,7 @@ def main():
     conn = connect(cfg.db_path)
     init_db(conn)
 
-    pin = input("Enter PIN/mot de passe: ").strip()
+    pin = getpass.getpass("Enter PIN/mot de passe: ").strip()
     if not pin:
         raise SystemExit("PIN empty")
 
@@ -272,7 +294,10 @@ def main():
     tpl_sha = sha256_file(template_path)
 
     s = open_card(10)
-    card_uid, wrote = s.provision_or_load_uid(user_id=args.user_id, tpl_sha256_hex=tpl_sha)
+    card_uid, wrote = s.provision_or_load_uid(
+        user_id=args.user_id,
+        tpl_sha256_hex=tpl_sha,
+    )
 
     print(f"[card] card_id={card_uid} atr={s.atr_hex}")
     print(f"[card] write_app_record={wrote}")
@@ -305,9 +330,18 @@ if __name__ == "__main__":
 FILE: scripts/recover_pin.py
 
 import hashlib
+import getpass
+import cv2
 
 from src.config import load_config
-from src.db import connect, init_db, get_user_by_card, update_user_pin, clear_auth_state, log_auth
+from src.db import (
+    connect,
+    init_db,
+    get_user_by_card,
+    update_user_pin,
+    clear_auth_state,
+    log_auth,
+)
 from src.security import pbkdf2_hash_pin, verify_file_sha256
 from src.camera import CameraParams, capture_frame
 from src.bio import compare_biometric
@@ -319,13 +353,9 @@ def _sha256_8_hex(s: str) -> str:
 
 
 def _tpl_hash8_from_sha256_hex(sha256_hex: str):
-    h = (sha256_hex or "").strip().lower()
-    if len(h) != 64:
+    if not sha256_hex or len(sha256_hex) != 64:
         return None
-    try:
-        return bytes.fromhex(h)[:8].hex()
-    except ValueError:
-        return None
+    return bytes.fromhex(sha256_hex)[:8].hex()
 
 
 def main():
@@ -353,18 +383,14 @@ def main():
     template_sha256 = user.get("template_sha256")
 
     if cfg.auth.enforce_template_integrity:
-        if not template_path or not template_sha256 or not verify_file_sha256(template_path, template_sha256):
+        if not verify_file_sha256(template_path, template_sha256):
             log_auth(conn, card_id, s.atr_hex, user_id, False, None, "DENY", "template_tampered")
             raise SystemExit("template_tampered")
 
     if cfg.auth.enforce_card_binding:
-        expected_user_hash8 = _sha256_8_hex(user_id)
-        expected_tpl_hash8 = _tpl_hash8_from_sha256_hex(template_sha256) if template_sha256 else None
-        if rec.user_hash8.lower() != expected_user_hash8:
-            log_auth(conn, card_id, s.atr_hex, user_id, False, None, "DENY", "card_user_binding_mismatch")
+        if rec.user_hash8.lower() != _sha256_8_hex(user_id):
             raise SystemExit("card_user_binding_mismatch")
-        if expected_tpl_hash8 is None or rec.tpl_hash8.lower() != expected_tpl_hash8:
-            log_auth(conn, card_id, s.atr_hex, user_id, False, None, "DENY", "card_template_binding_mismatch")
+        if rec.tpl_hash8.lower() != _tpl_hash8_from_sha256_hex(template_sha256):
             raise SystemExit("card_template_binding_mismatch")
 
     frame = capture_frame(CameraParams(
@@ -374,12 +400,7 @@ def main():
         height=cfg.camera.height,
     ))
 
-    import cv2
-    template = cv2.imread(template_path) if template_path else None
-    if template is None:
-        log_auth(conn, card_id, s.atr_hex, user_id, False, None, "DENY", "template_read_error")
-        raise SystemExit("template_read_error")
-
+    template = cv2.imread(template_path)
     score = compare_biometric(
         captured_bgr=frame,
         template_bgr=template,
@@ -388,20 +409,18 @@ def main():
     )
 
     if score < cfg.biometric.score_threshold:
-        log_auth(conn, card_id, s.atr_hex, user_id, False, score, "DENY", "biometric_mismatch")
         raise SystemExit("biometric_mismatch")
 
-    new_pin1 = input("Enter new PIN/mot de passe: ").strip()
-    new_pin2 = input("Re-enter new PIN/mot de passe: ").strip()
+    new_pin1 = getpass.getpass("Enter new PIN/mot de passe: ").strip()
+    new_pin2 = getpass.getpass("Re-enter new PIN/mot de passe: ").strip()
     if not new_pin1 or new_pin1 != new_pin2:
-        log_auth(conn, card_id, s.atr_hex, user_id, False, score, "DENY", "pin_mismatch")
         raise SystemExit("pin_mismatch")
 
     salt, ph = pbkdf2_hash_pin(new_pin1)
     update_user_pin(conn, user_id, salt, ph)
     clear_auth_state(conn, user_id)
-    log_auth(conn, card_id, s.atr_hex, user_id, True, score, "ALLOW", "pin_recovered")
 
+    log_auth(conn, card_id, s.atr_hex, user_id, True, score, "ALLOW", "pin_recovered")
     print(f"PIN recovered: user_id={user_id} card_id={card_id} bio_score={score:.3f}")
 
 
@@ -623,6 +642,7 @@ if __name__ == "__main__":
 FILE: scripts/test_card.py
 
 import argparse
+from typing import Optional
 
 from src.card import CardSession
 
@@ -638,6 +658,53 @@ def _print_app_record(r) -> None:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Print detailed card information")
+    parser.add_argument("--timeout", type=int, default=30, help="Timeout seconds when waiting for a card")
+    parser.add_argument("--simulate-card-id", dest="sim_card_id", help="Simulated card_id (for offline testing)")
+    parser.add_argument("--simulate-atr", dest="sim_atr", help="Simulated ATR hex string (for offline testing)")
+    args = parser.parse_args()
+
+    # If simulation args are provided, print them and exit
+    if args.sim_card_id or args.sim_atr:
+        print("Simulated card info:")
+        print(f"  card_id = {args.sim_card_id}")
+        print(f"  atr_hex = {args.sim_atr}")
+        return
+
+    try:
+        s = CardSession(timeout_seconds=args.timeout)
+    except Exception as e:
+        print(f"No card found or error: {e}")
+        return
+
+    # ATR
+    print(f"ATR: {s.atr_hex}")
+
+    # Issuer SN
+    try:
+        issuer = s.get_issuer_sn()
+        print(f"Issuer SN (raw): {issuer.hex()}")
+    except Exception as e:
+        print(f"Could not read issuer SN: {e}")
+
+    # UID derived from issuer
+    try:
+        uid_from_issuer = s.uid_from_issuer()
+        print(f"UID from issuer: {uid_from_issuer}")
+    except Exception as e:
+        print(f"Could not compute uid from issuer: {e}")
+
+    # Stored app record UID
+    card_id = s.get_uid()
+    print(f"Stored card_id (app record): {card_id}")
+
+    # App record details
+    try:
+        app = s.read_app_record()
+        _print_app_record(app)
+    except Exception as e:
+        print(f"Could not read app record: {e}")
+
     parser = argparse.ArgumentParser(description="Print detailed card information")
     parser.add_argument("--timeout", type=int, default=30, help="Timeout seconds when waiting for a card")
     parser.add_argument("--simulate-card-id", dest="sim_card_id", help="Simulated card_id (for offline testing)")
@@ -905,8 +972,9 @@ def orb_score(img1_gray: np.ndarray, img2_gray: np.ndarray, nfeatures: int = 800
     if not matches:
         return 0.0
 
+    # Smaller distances indicate more similarity; use the proportion of "good" matches as the score
     matches = sorted(matches, key=lambda m: m.distance)
-    good = [m for m in matches if m.distance < 50]  
+    good = [m for m in matches if m.distance < 50]  # empirical threshold
     score = len(good) / max(len(matches), 1)
     return float(score)
 
@@ -983,9 +1051,9 @@ GCM_ATR = [0x3B, 0x02, 0x53, 0x01]
 GCM_ATR_MASK = [0xFF, 0xFF, 0xFF, 0x00]
 GCM_CARD_TYPE = ATRCardType(GCM_ATR, GCM_ATR_MASK)
 
-INS_READ = 0xBE
-INS_UPDATE = 0xDE
-INS_VERIFY = 0x20
+INS_READ = 0xBE # read 4 bytes from an addr
+INS_UPDATE = 0xDE # write 4 bytes to an addr
+INS_VERIFY = 0x20 # verify code on card
 
 ADDR_ISSUER_BASE = 0x01
 ADDR_USER1_BASE = 0x10
@@ -1199,6 +1267,26 @@ class CardSession:
     def get_uid(self) -> Optional[str]:
         r = self.read_app_record()
         return None if r is None else r.card_uid
+
+
+@dataclass
+class CardInfo:
+    card_id: Optional[str]
+    atr_hex: Optional[str]
+
+
+def get_card_id(simulate_card=None, timeout_seconds: int = 10) -> CardInfo:
+    """Return CardInfo for the first detected card or simulated info.
+    If a card is not present or an error occurs, returns CardInfo(card_id=None, atr_hex=None).
+    """
+    if simulate_card is not None:
+        # expected format: {'card_id': str, 'atr_hex': str}
+        return CardInfo(card_id=simulate_card.get('card_id'), atr_hex=simulate_card.get('atr_hex'))
+    try:
+        s = CardSession(timeout_seconds=timeout_seconds)
+    except Exception:
+        return CardInfo(card_id=None, atr_hex=None)
+    return CardInfo(card_id=s.get_uid(), atr_hex=s.atr_hex)
 
 
 def open_card(timeout_seconds: int = 10) -> CardSession:
@@ -1818,7 +1906,7 @@ def verify_pin(
     """
     pepper = _load_pepper_bytes()
 
-    # Try with current pepper mode
+# Try with current pepper mode
     material = pin.encode("utf-8") + pepper
     dk = hashlib.pbkdf2_hmac("sha256", material, salt, iterations, dklen=32)
     if hmac.compare_digest(dk, expected_hash):
