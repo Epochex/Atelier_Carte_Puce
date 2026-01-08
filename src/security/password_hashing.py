@@ -69,7 +69,7 @@ def verify_pin(
     """
     pepper = _load_pepper_bytes()
 
-    # Try with current pepper mode
+# Try with current pepper mode
     material = pin.encode("utf-8") + pepper
     dk = hashlib.pbkdf2_hmac("sha256", material, salt, iterations, dklen=32)
     if hmac.compare_digest(dk, expected_hash):

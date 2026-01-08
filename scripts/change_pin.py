@@ -58,6 +58,18 @@ def main():
         raise SystemExit("bad_pin")
 
     new_pin1 = getpass.getpass("Enter new PIN/mot de passe: ").strip()
-    new_pin2 = getpass.getpass("Re-enter new PIN/mot de passe: ").strip()
+    new_pin2 = getpass.getpass("Confirm new PIN/mot de passe: ").strip()
     if not new_pin1 or new_pin1 != new_pin2:
         raise SystemExit("pin_mismatch")
+
+    # Hash the new PIN and update the database
+    salt, ph = pbkdf2_hash_pin(new_pin1)
+    update_user_pin(conn, user_id, salt, ph)
+    # Clear any recorded failures so the user isn't locked out after a successful change
+    clear_auth_state(conn, user_id)
+
+    print(f"PIN changed: user_id={user_id} card_id={card_id}")
+
+
+if __name__ == "__main__":
+    main()
