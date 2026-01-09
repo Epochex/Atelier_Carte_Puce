@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 
 @dataclass
@@ -19,8 +19,11 @@ class FaceEyesDet:
     raw: str = ""
 
 
-_FACE_RE = re.compile(r"Face=\((\-?\d+),(\-?\d+)\)")
-_EYES_RE = re.compile(r"Eyes=\((\-?\d+),(\-?\d+)\)\s+\((\-?\d+),(\-?\d+)\).*?\sr=(\d+)")
+_FACE_RE = re.compile(r"Face\s*=\s*\(\s*(\-?\d+)\s*,\s*(\-?\d+)\s*\)")
+_EYES_RE = re.compile(
+    r"Eyes\s*=\s*\(\s*(\-?\d+)\s*,\s*(\-?\d+)\s*\)\s+"
+    r"\(\s*(\-?\d+)\s*,\s*(\-?\d+)\s*\).*?\br\s*=\s*(\d+)"
+)
 
 
 def _default_bin_path() -> str:
@@ -30,13 +33,18 @@ def _default_bin_path() -> str:
     return os.path.join(root, "vision", "bin", "ght_face_eyes")
 
 
-def detect_face_eyes_by_ght(image_path: str, bin_path: Optional[str] = None, timeout_sec: int = 5) -> FaceEyesDet:
+def detect_face_eyes_by_ght(
+    image_path: str,
+    bin_path: Optional[str] = None,
+    timeout_sec: int = 5,
+    headless: bool = True,
+) -> FaceEyesDet:
     """
-    Call  C++ GHT detector:
-      ght_face_eyes --image <path>
-    Parse stdout for Face / Eyes.
+    Call C++ GHT detector and parse stdout for Face/Eyes.
 
-    Returns FaceEyesDet with coordinates in pixel space of the input image.
+      ght_face_eyes --image <path> [--no-gui]
+
+    Headless mode avoids GUI windows + waitKey(0) blocking in automation.
     """
     if not image_path or not os.path.exists(image_path):
         return FaceEyesDet(face_ok=False, eyes_ok=False, raw="image_not_found")
@@ -45,9 +53,14 @@ def detect_face_eyes_by_ght(image_path: str, bin_path: Optional[str] = None, tim
     if not os.path.exists(exe):
         return FaceEyesDet(face_ok=False, eyes_ok=False, raw=f"vision_binary_not_found:{exe}")
 
+    cmd: List[str] = [exe, "--image", image_path]
+    if headless:
+        # supported by your patched C++ (also accepts --headless)
+        cmd.append("--no-gui")
+
     try:
         cp = subprocess.run(
-            [exe, "--image", image_path],
+            cmd,
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -60,21 +73,35 @@ def detect_face_eyes_by_ght(image_path: str, bin_path: Optional[str] = None, tim
 
     out = (cp.stdout or "").strip()
     err = (cp.stderr or "").strip()
-    raw = (out + ("\n" + err if err else "")).strip()
 
-    face_ok = "Face=NOTFOUND" not in out and bool(_FACE_RE.search(out))
-    eyes_m = _EYES_RE.search(out)
-    eyes_ok = "Eyes=NOTFOUND" not in out and (eyes_m is not None)
+    raw = (
+        f"cmd={cmd}\n"
+        f"returncode={cp.returncode}\n"
+        f"--- stdout ---\n{out}\n"
+        f"--- stderr ---\n{err}\n"
+    ).strip()
+
+    parse_text = out if out else err
+    if not parse_text:
+        return FaceEyesDet(face_ok=False, eyes_ok=False, raw="no_output_from_vision_binary\n" + raw)
+
+    face_notfound = re.search(r"Face\s*=\s*NOTFOUND", parse_text) is not None
+    eyes_notfound = re.search(r"Eyes\s*=\s*NOTFOUND", parse_text) is not None
+
+    fm = _FACE_RE.search(parse_text)
+    em = _EYES_RE.search(parse_text)
+
+    face_ok = (not face_notfound) and (fm is not None)
+    eyes_ok = (not eyes_notfound) and (em is not None)
 
     det = FaceEyesDet(face_ok=face_ok, eyes_ok=eyes_ok, raw=raw)
 
-    fm = _FACE_RE.search(out)
     if fm:
         det.face_center = (int(fm.group(1)), int(fm.group(2)))
 
-    if eyes_m:
-        det.eye1 = (int(eyes_m.group(1)), int(eyes_m.group(2)))
-        det.eye2 = (int(eyes_m.group(3)), int(eyes_m.group(4)))
-        det.eye_r = int(eyes_m.group(5))
+    if em:
+        det.eye1 = (int(em.group(1)), int(em.group(2)))
+        det.eye2 = (int(em.group(3)), int(em.group(4)))
+        det.eye_r = int(em.group(5))
 
     return det

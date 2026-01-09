@@ -1,6 +1,8 @@
 #include <opencv2/videoio.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <array>
@@ -10,21 +12,20 @@
 #include <iostream>
 #include <limits>
 #include <string>
-#include <tuple>
 #include <vector>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
-// Utils
-static int clampi(int v, int lo, int hi) {
-    if (v < lo) return lo;
-    if (v > hi) return hi;
+// utils
+static int clampInt(int v, int minV, int maxV) {
+    if (v < minV) return minV;
+    if (v > maxV) return maxV;
     return v;
 }
 
-static int degBin(float radians) {
+static int binDeg(float radians) {
     float deg = radians * 180.0f / float(M_PI);
     int b = (int)std::lround(deg);
     b = b % 360;
@@ -33,7 +34,7 @@ static int degBin(float radians) {
 }
 
 // image en gris
-struct GrayImage {
+struct grayImage {
     int w = 0, h = 0;
     std::vector<uint8_t> p;
 
@@ -41,71 +42,160 @@ struct GrayImage {
     uint8_t  at(int y, int x) const { return p[(size_t)y * (size_t)w + (size_t)x]; }
 };
 
-static GrayImage makeGray(int w, int h, uint8_t value) {
-    GrayImage g;
+static grayImage makeGris(int w, int h, uint8_t value) {
+    grayImage g;
     g.w = w;
     g.h = h;
     g.p.assign((size_t)w * (size_t)h, value);
     return g;
 }
 
-// BGR -> Gray manuel
-static GrayImage bgrToGray(const cv::Mat& frame) {
-    GrayImage g;
+// BGR en gris
+static grayImage bgrToGray(const cv::Mat& frame) {
+    grayImage g;
     g.w = frame.cols;
     g.h = frame.rows;
-    g.p.resize((size_t)g.w * (size_t)g.h);
+    g.p.assign((size_t)g.w * (size_t)g.h, 0);
 
     for (int y = 0; y < g.h; ++y) {
-        const uint8_t* row = frame.ptr<uint8_t>(y);
+        const cv::Vec3b* row = frame.ptr<cv::Vec3b>(y);
         for (int x = 0; x < g.w; ++x) {
-            uint8_t b = row[3 * x + 0];
-            uint8_t gg = row[3 * x + 1];
-            uint8_t r = row[3 * x + 2];
-            int gray = (299 * (int)r + 587 * (int)gg + 114 * (int)b) / 1000;
-            g.at(y, x) = (uint8_t)clampi(gray, 0, 255);
+            // BGR
+            const int b = row[x][0];
+            const int gg = row[x][1];
+            const int r = row[x][2];
+            int v = (int)std::lround(0.114 * b + 0.587 * gg + 0.299 * r);
+            g.at(y, x) = (uint8_t)clampInt(v, 0, 255);
         }
     }
     return g;
 }
 
-// Sobel maison
-struct Gradients {
+// Conversion to cv::Mat (debug)
+static cv::Mat toMatGray8(const grayImage& g) {
+    cv::Mat m(g.h, g.w, CV_8UC1);
+    for (int y = 0; y < g.h; ++y) {
+        uint8_t* row = m.ptr<uint8_t>(y);
+        for (int x = 0; x < g.w; ++x) row[x] = g.at(y, x);
+    }
+    return m;
+}
+
+struct ChampGradient {
     int w = 0, h = 0;
-    std::vector<int16_t> gx;
-    std::vector<int16_t> gy;
-    std::vector<uint16_t> mag; // |gx| + |gy|
+    std::vector<int16_t> gradX;
+    std::vector<int16_t> gradY;
+    std::vector<uint16_t> mag;
     uint16_t Mag(int y, int x) const { return mag[(size_t)y * (size_t)w + (size_t)x]; }
 };
 
-static Gradients sobelManual(const GrayImage& g) {
-    Gradients out;
-    out.w = g.w;
-    out.h = g.h;
-    out.gx.assign((size_t)out.w * (size_t)out.h, 0);
-    out.gy.assign((size_t)out.w * (size_t)out.h, 0);
+static ChampGradient sobel(const grayImage& g) {
+    ChampGradient out;
+    out.w = g.w; out.h = g.h;
+    out.gradX.assign((size_t)out.w * (size_t)out.h, 0);
+    out.gradY.assign((size_t)out.w * (size_t)out.h, 0);
     out.mag.assign((size_t)out.w * (size_t)out.h, 0);
 
     for (int y = 1; y < g.h - 1; ++y) {
         for (int x = 1; x < g.w - 1; ++x) {
-            int a00 = g.at(y - 1, x - 1), a01 = g.at(y - 1, x), a02 = g.at(y - 1, x + 1);
-            int a10 = g.at(y,     x - 1),                         a12 = g.at(y,     x + 1);
-            int a20 = g.at(y + 1, x - 1), a21 = g.at(y + 1, x), a22 = g.at(y + 1, x + 1);
+            int gx =
+                -1 * g.at(y - 1, x - 1) + 1 * g.at(y - 1, x + 1) +
+                -2 * g.at(y, x - 1)     + 2 * g.at(y, x + 1) +
+                -1 * g.at(y + 1, x - 1) + 1 * g.at(y + 1, x + 1);
 
-            int gx = (-a00 + a02) + (-2 * a10 + 2 * a12) + (-a20 + a22);
-            int gy = (-a00 - 2 * a01 - a02) + (a20 + 2 * a21 + a22);
+            int gy =
+                -1 * g.at(y - 1, x - 1) + -2 * g.at(y - 1, x) + -1 * g.at(y - 1, x + 1) +
+                 1 * g.at(y + 1, x - 1) +  2 * g.at(y + 1, x) +  1 * g.at(y + 1, x + 1);
 
-            out.gx[(size_t)y * (size_t)out.w + (size_t)x] = (int16_t)gx;
-            out.gy[(size_t)y * (size_t)out.w + (size_t)x] = (int16_t)gy;
+            out.gradX[(size_t)y * (size_t)out.w + (size_t)x] = (int16_t)gx;
+            out.gradY[(size_t)y * (size_t)out.w + (size_t)x] = (int16_t)gy;
 
-            int m = std::abs(gx) + std::abs(gy);
-            out.mag[(size_t)y * (size_t)out.w + (size_t)x] = (uint16_t)clampi(m, 0, 65535);
+            int m = (int)std::lround(std::sqrt((double)gx * (double)gx + (double)gy * (double)gy));
+            out.mag[(size_t)y * (size_t)out.w + (size_t)x] = (uint16_t)clampInt(m, 0, 65535);
         }
     }
     return out;
 }
 
-// Accumulateur + ROI
+static cv::Mat toMatMag8(const ChampGradient& cg) {
+    uint16_t maxV = 1;
+    for (auto v : cg.mag) maxV = std::max<uint16_t>(maxV, v);
+
+    cv::Mat m(cg.h, cg.w, CV_8UC1);
+    for (int y = 0; y < cg.h; ++y) {
+        uint8_t* row = m.ptr<uint8_t>(y);
+        for (int x = 0; x < cg.w; ++x) {
+            uint16_t v = cg.mag[(size_t)y * (size_t)cg.w + (size_t)x];
+            row[x] = (uint8_t)((uint32_t)v * 255u / (uint32_t)maxV);
+        }
+    }
+    return m;
+}
+
+// R-Table (GHT)
+struct Decalage { int dx = 0, dy = 0; };
+using RTable = std::array<std::vector<Decalage>, 360>;
+
+static grayImage templateEllipse(int w, int h, float rx, float ry) {
+    grayImage t = makeGris(w, h, 0);
+    int cx = w / 2;
+    int cy = h / 2;
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float dx = (float)(x - cx);
+            float dy = (float)(y - cy);
+            float v = (dx*dx) / (rx*rx) + (dy*dy) / (ry*ry);
+            if (std::abs(v - 1.0f) < 0.05f) t.at(y, x) = 255;
+        }
+    }
+    return t;
+}
+
+static grayImage templateCercle(int w, int h, float r) {
+    grayImage t = makeGris(w, h, 0);
+    int cx = w / 2;
+    int cy = h / 2;
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            float dx = (float)(x - cx);
+            float dy = (float)(y - cy);
+            float v = std::sqrt(dx*dx + dy*dy);
+            if (std::abs(v - r) < 1.5f) t.at(y, x) = 255;
+        }
+    }
+    return t;
+}
+
+static RTable construireRTableDepuisTemplate(const grayImage& templ, int maxParBin, uint16_t seuilEdgeMag) {
+    RTable lut;
+    for (auto& v : lut) v.clear();
+
+    ChampGradient tg = sobel(templ);
+    int cx = templ.w / 2;
+    int cy = templ.h / 2;
+
+    for (int y = 1; y < templ.h - 1; ++y) {
+        for (int x = 1; x < templ.w - 1; ++x) {
+            if (tg.Mag(y, x) < seuilEdgeMag) continue;
+
+            float gx = (float)tg.gradX[(size_t)y * (size_t)templ.w + (size_t)x];
+            float gy = (float)tg.gradY[(size_t)y * (size_t)templ.w + (size_t)x];
+            if (gx == 0.0f && gy == 0.0f) continue;
+
+            int aBin = binDeg(std::atan2(gy, gx));
+
+            Decalage off;
+            off.dx = cx - x;
+            off.dy = cy - y;
+
+            if ((int)lut[aBin].size() < maxParBin) lut[aBin].push_back(off);
+        }
+    }
+    return lut;
+}
+
 struct AccuImage {
     int w = 0, h = 0;
     std::vector<uint16_t> a;
@@ -115,131 +205,82 @@ struct AccuImage {
 
 static AccuImage makeAccu(int w, int h) {
     AccuImage A;
-    A.w = w;
-    A.h = h;
+    A.w = w; A.h = h;
     A.a.assign((size_t)w * (size_t)h, 0);
     return A;
 }
 
-struct Roi { int x0=0,y0=0,x1=0,y1=0; };
+static cv::Mat toMatAccu8(const AccuImage& A) {
+    uint16_t maxV = 1;
+    for (auto v : A.a) maxV = std::max<uint16_t>(maxV, v);
 
-static Roi clampRoi(Roi r, int w, int h) {
-    r.x0 = clampi(r.x0, 0, w);
-    r.x1 = clampi(r.x1, 0, w);
-    r.y0 = clampi(r.y0, 0, h);
-    r.y1 = clampi(r.y1, 0, h);
-
-    if (r.x1 < r.x0) std::swap(r.x0, r.x1);
-    if (r.y1 < r.y0) std::swap(r.y0, r.y1);
-    return r;
-}
-
-static bool roiValid(const Roi& r) {
-    int ww = r.x1 - r.x0;
-    int hh = r.y1 - r.y0;
-    if (ww >= 8 && hh >= 8) return true;
-    return false;
-}
-
-// R-table (alpha -> offsets dx,dy)
-struct Offset { int dx; int dy; };
-using LUTOffsets = std::array<std::vector<Offset>, 360>;
-
-static LUTOffsets buildLUTOffsetsFromTemplate(const GrayImage& templ, int edgeThresholdMag, int maxPerBin) {
-    LUTOffsets lut;
-    for (int i = 0; i < 360; ++i) lut[i].clear();
-
-    Gradients tg = sobelManual(templ);
-    int cx = templ.w / 2;
-    int cy = templ.h / 2;
-
-    for (int y = 1; y < templ.h - 1; ++y) {
-        for (int x = 1; x < templ.w - 1; ++x) {
-            if (tg.Mag(y, x) < edgeThresholdMag) continue;
-
-            float gx = (float)tg.gx[(size_t)y * (size_t)templ.w + (size_t)x];
-            float gy = (float)tg.gy[(size_t)y * (size_t)templ.w + (size_t)x];
-            if (gx == 0.0f && gy == 0.0f) continue;
-
-            int aBin = degBin(std::atan2(gy, gx));
-
-            Offset off;
-            off.dx = cx - x;
-            off.dy = cy - y;
-
-            if ((int)lut[aBin].size() < maxPerBin) lut[aBin].push_back(off);
+    cv::Mat m(A.h, A.w, CV_8UC1);
+    for (int y = 0; y < A.h; ++y) {
+        uint8_t* row = m.ptr<uint8_t>(y);
+        for (int x = 0; x < A.w; ++x) {
+            uint16_t v = A.at(y, x);
+            row[x] = (uint8_t)((uint32_t)v * 255u / (uint32_t)maxV);
         }
     }
-    return lut;
+    return m;
 }
 
-static AccuImage voteOffsets(const Gradients& grads, const LUTOffsets& lut, int edgeThresholdMag, Roi roiIn) {
-    AccuImage accu = makeAccu(grads.w, grads.h);
+// Vote
+static void voter(AccuImage& accu, const grayImage& img, const ChampGradient& cg, const RTable& lut, uint16_t seuilEdgeMag) {
+    for (int y = 1; y < img.h - 1; ++y) {
+        for (int x = 1; x < img.w - 1; ++x) {
+            uint16_t m = cg.Mag(y, x);
+            if (m < seuilEdgeMag) continue;
 
-    Roi roi = clampRoi(roiIn, accu.w, accu.h);
-    if (!roiValid(roi)) return accu;
-
-    int x0 = std::max(1, roi.x0);
-    int x1 = std::min(accu.w - 2, roi.x1);
-    int y0 = std::max(1, roi.y0);
-    int y1 = std::min(accu.h - 2, roi.y1);
-
-    for (int y = y0; y < y1; ++y) {
-        for (int x = x0; x < x1; ++x) {
-            if (grads.Mag(y, x) < edgeThresholdMag) continue;
-
-            float gx = (float)grads.gx[(size_t)y * (size_t)accu.w + (size_t)x];
-            float gy = (float)grads.gy[(size_t)y * (size_t)accu.w + (size_t)x];
+            float gx = (float)cg.gradX[(size_t)y * (size_t)img.w + (size_t)x];
+            float gy = (float)cg.gradY[(size_t)y * (size_t)img.w + (size_t)x];
             if (gx == 0.0f && gy == 0.0f) continue;
 
-            int aBin = degBin(std::atan2(gy, gx));
-            const std::vector<Offset>& offs = lut[aBin];
-            if (offs.empty()) continue;
+            int aBin = binDeg(std::atan2(gy, gx));
+            const auto& offs = lut[aBin];
 
-            for (size_t i = 0; i < offs.size(); ++i) {
-                int cx = x + offs[i].dx;
-                int cy = y + offs[i].dy;
-                if (cx >= 0 && cx < accu.w && cy >= 0 && cy < accu.h) {
-                    uint16_t v = accu.at(cy, cx);
-                    if (v < std::numeric_limits<uint16_t>::max()) accu.at(cy, cx) = (uint16_t)(v + 1);
-                }
+            for (const auto& off : offs) {
+                int cx = x + off.dx;
+                int cy = y + off.dy;
+                if (cx < 0 || cx >= accu.w || cy < 0 || cy >= accu.h) continue;
+                uint16_t& v = accu.at(cy, cx);
+                if (v < std::numeric_limits<uint16_t>::max()) v++;
             }
         }
     }
-    return accu;
 }
 
-// Pic + barycentre local
-struct PeakBary {
+struct PicBary {
     bool ok = false;
     int px = -1, py = -1;
     uint16_t peak = 0;
     float bx = 0.0f, by = 0.0f;
 };
 
-static PeakBary localBarycenterAroundMax(const AccuImage& accu, int radius) {
-    PeakBary out;
-
-    int px = -1, py = -1;
+static PicBary barycentreLocalAutourMax(const AccuImage& A, int baryRadius) {
+    PicBary out;
     uint16_t best = 0;
-    for (int y = 0; y < accu.h; ++y) {
-        for (int x = 0; x < accu.w; ++x) {
-            uint16_t v = accu.at(y, x);
+    int px = -1, py = -1;
+    for (int y = 0; y < A.h; ++y) {
+        for (int x = 0; x < A.w; ++x) {
+            uint16_t v = A.at(y, x);
             if (v > best) { best = v; px = x; py = y; }
         }
     }
-    if (px < 0) return out;
-    if (best == 0) return out;
+    if (px < 0 || py < 0) return out;
 
-    double sw = 0.0, sx = 0.0, sy = 0.0;
-    int x0 = std::max(0, px - radius);
-    int x1 = std::min(accu.w - 1, px + radius);
-    int y0 = std::max(0, py - radius);
-    int y1 = std::min(accu.h - 1, py + radius);
+    double sw = 0.0;
+    double sx = 0.0;
+    double sy = 0.0;
+
+    int x0 = std::max(0, px - baryRadius);
+    int x1 = std::min(A.w - 1, px + baryRadius);
+    int y0 = std::max(0, py - baryRadius);
+    int y1 = std::min(A.h - 1, py + baryRadius);
 
     for (int y = y0; y <= y1; ++y) {
         for (int x = x0; x <= x1; ++x) {
-            uint16_t w = accu.at(y, x);
+            uint16_t w = A.at(y, x);
             sw += (double)w;
             sx += (double)x * (double)w;
             sy += (double)y * (double)w;
@@ -256,8 +297,8 @@ static PeakBary localBarycenterAroundMax(const AccuImage& accu, int radius) {
     return out;
 }
 
-// TopK pics + NMS (pour 2 yeux)
-struct PeakPoint {
+// TopK + NMS
+struct PicPoint {
     int x = -1;
     int y = -1;
     uint16_t v = 0;
@@ -265,7 +306,7 @@ struct PeakPoint {
     float by = 0.0f;
 };
 
-static void suppressDisk(AccuImage& A, int cx, int cy, int r) {
+static void nmsDisque(AccuImage& A, int cx, int cy, int r) {
     int rr = r * r;
     int x0 = std::max(0, cx - r);
     int x1 = std::min(A.w - 1, cx + r);
@@ -281,39 +322,39 @@ static void suppressDisk(AccuImage& A, int cx, int cy, int r) {
     }
 }
 
-static std::vector<PeakPoint> topKPeaksWithBary(AccuImage A, int k, int nmsRadius, int baryRadius, uint16_t minVal) {
-    std::vector<PeakPoint> out;
+static std::vector<PicPoint> topKpicsAvecBary(AccuImage A, int k, int nmsRadius, int baryRadius, uint16_t minVal) {
+    std::vector<PicPoint> out;
 
     for (int i = 0; i < k; ++i) {
-        PeakBary b = localBarycenterAroundMax(A, baryRadius);
+        PicBary b = barycentreLocalAutourMax(A, baryRadius);
         if (!b.ok) break;
         if (b.peak < minVal) break;
 
-        PeakPoint p;
+        PicPoint p;
         p.x = b.px; p.y = b.py; p.v = b.peak;
         p.bx = b.bx; p.by = b.by;
         out.push_back(p);
 
-        suppressDisk(A, b.px, b.py, nmsRadius);
+        nmsDisque(A, b.px, b.py, nmsRadius);
     }
     return out;
 }
 
-static bool pickBestEyePair(
-    const std::vector<PeakPoint>& peaks,
+static bool choisirPaireYeux(
+    const std::vector<PicPoint>& pics,
     int faceX, int faceY,
     int minDx, int maxDx, int maxDy,
-    PeakPoint& leftEye, PeakPoint& rightEye
+    PicPoint& oeilGauche, PicPoint& oeilDroit
 ) {
     bool found = false;
     uint32_t bestSum = 0;
 
-    for (size_t i = 0; i < peaks.size(); ++i) {
-        for (size_t j = i + 1; j < peaks.size(); ++j) {
-            int ax = (int)std::lround(peaks[i].bx);
-            int ay = (int)std::lround(peaks[i].by);
-            int bx = (int)std::lround(peaks[j].bx);
-            int by = (int)std::lround(peaks[j].by);
+    for (size_t i = 0; i < pics.size(); ++i) {
+        for (size_t j = i + 1; j < pics.size(); ++j) {
+            int ax = (int)std::lround(pics[i].bx);
+            int ay = (int)std::lround(pics[i].by);
+            int bx = (int)std::lround(pics[j].bx);
+            int by = (int)std::lround(pics[j].by);
 
             int dx = std::abs(ax - bx);
             int dy = std::abs(ay - by);
@@ -322,225 +363,184 @@ static bool pickBestEyePair(
             if (dx > maxDx) continue;
             if (dy > maxDy) continue;
 
-            // yeux au-dessus du centre visage
-            if (ay >= faceY) continue;
-            if (by >= faceY) continue;
+            // also constrain around face center (eyes should be above face center)
+            if (ay > faceY) continue;
+            if (by > faceY) continue;
 
-            uint32_t sum = (uint32_t)peaks[i].v + (uint32_t)peaks[j].v;
+            uint32_t sum = (uint32_t)pics[i].v + (uint32_t)pics[j].v;
             if (!found || sum > bestSum) {
                 found = true;
                 bestSum = sum;
-
-                if (ax <= bx) { leftEye = peaks[i]; rightEye = peaks[j]; }
-                else { leftEye = peaks[j]; rightEye = peaks[i]; }
+                // left/right by x
+                if (ax <= bx) { oeilGauche = pics[i]; oeilDroit = pics[j]; }
+                else          { oeilGauche = pics[j]; oeilDroit = pics[i]; }
             }
         }
     }
     return found;
 }
 
-// Templates artificiels (contours noirs sur fond blanc)
-static GrayImage makeEllipseTemplate(int w, int h, float rx, float ry) {
-    GrayImage t = makeGray(w, h, 255);
-    float cx = (float)(w / 2);
-    float cy = (float)(h / 2);
-
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float dx = (float)x - cx;
-            float dy = (float)y - cy;
-            float v = (dx*dx)/(rx*rx) + (dy*dy)/(ry*ry);
-            if (std::fabs(v - 1.0f) < 0.03f) t.at(y, x) = 0;
-        }
-    }
-    return t;
-}
-
-static GrayImage makeCircleTemplate(int w, int h, float r) {
-    GrayImage t = makeGray(w, h, 255);
-    float cx = (float)(w / 2);
-    float cy = (float)(h / 2);
-
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float dx = (float)x - cx;
-            float dy = (float)y - cy;
-            float d = std::sqrt(dx*dx + dy*dy);
-            if (std::fabs(d - r) < 3.0f) t.at(y, x) = 0;
-        }
-    }
-    return t;
-}
-
-// Images artificielles pour --test
-static GrayImage makeArtificialEllipseImage(int w, int h) {
-    GrayImage img = makeGray(w, h, 255);
-    int cx = w / 2;
-    int cy = h / 2;
-
-    float ry = 0.35f * (float)h;
-    float rx = 0.5f * ry;
-
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float dx = (float)(x - cx);
-            float dy = (float)(y - cy);
-            float v = (dx*dx)/(rx*rx) + (dy*dy)/(ry*ry);
-            if (std::fabs(v - 1.0f) < 0.03f) img.at(y, x) = 0;
-        }
-    }
-    return img;
-}
-
-static GrayImage makeArtificialCircleImage(int w, int h) {
-    GrayImage img = makeGray(w, h, 255);
-    int cx = w / 2;
-    int cy = h / 2;
-    float r = 0.30f * (float)std::min(w, h);
-
-    for (int y = 0; y < h; ++y) {
-        for (int x = 0; x < w; ++x) {
-            float dx = (float)(x - cx);
-            float dy = (float)(y - cy);
-            float d = std::sqrt(dx*dx + dy*dy);
-            if (std::fabs(d - r) < 3.0f) img.at(y, x) = 0;
-        }
-    }
-    return img;
-}
-
-// Modèles multi-échelle
-struct FaceModel {
-    int rx = 0;
-    int ry = 0;
-    LUTOffsets lut;
-};
-
-struct EyeModel {
-    int r = 0;
-    LUTOffsets lut;
-};
-
-// Détection visage + 2 yeux
-struct FaceEyes {
+struct faceeyes {
     bool faceOk = false;
-    int faceX = -1, faceY = -1;
-    uint16_t faceScore = 0;
-    int faceRx = 0;
-    int faceRy = 0;
-
+    int faceX = 0, faceY = 0;
     bool eyesOk = false;
-    int ex1=-1, ey1=-1;
-    int ex2=-1, ey2=-1;
-    uint16_t eyeScoreSum = 0;
+    int ex1 = 0, ey1 = 0, ex2 = 0, ey2 = 0;
     int eyeR = 0;
+
+    // debug
+    ChampGradient dbgGrads;
+    bool dbgFaceAccuOk = false;
+    AccuImage dbgFaceAccu;
+    bool dbgEyeAccuOk = false;
+    AccuImage dbgEyeAccu;
 };
 
-static FaceEyes detectFaceEyes(
-    const GrayImage& gray,
-    const std::vector<FaceModel>& faceModels,
-    const std::vector<EyeModel>& eyeModels,
-    int EDGE_FACE,
-    int EDGE_EYE,
-    uint16_t FACE_MIN_SCORE,
-    uint16_t EYE_MIN_PEAK
+struct facemodel { int rx = 0, ry = 0; RTable lut; };
+struct eyemodel  { int r = 0; RTable lut; };
+
+static faceeyes detectfaceeyes(
+    const grayImage& img,
+    const std::vector<facemodel>& faceModels,
+    const std::vector<eyemodel>& eyeModels,
+    uint16_t seuilFace, uint16_t seuilEye,
+    uint16_t faceMinScore, uint16_t eyeMinPeak
 ) {
-    FaceEyes out;
-    Gradients grads = sobelManual(gray);
+    faceeyes out;
+    out.dbgGrads = sobel(img);
 
-    Roi faceRoi;
-    faceRoi.x0 = (int)(gray.w * 0.10);
-    faceRoi.x1 = (int)(gray.w * 0.90);
-    faceRoi.y0 = (int)(gray.h * 0.05);
-    faceRoi.y1 = (int)(gray.h * 0.95);
-
-    bool bestOk = false;
-    PeakBary bestPeak;
+    // FACE: pick best model by peak
+    uint16_t bestFacePeak = 0;
+    int bestFaceX = 0, bestFaceY = 0;
     int bestRx = 0, bestRy = 0;
+    AccuImage bestAccu = makeAccu(img.w, img.h);
 
-    for (size_t i = 0; i < faceModels.size(); ++i) {
-        AccuImage A = voteOffsets(grads, faceModels[i].lut, EDGE_FACE, faceRoi);
-        PeakBary p = localBarycenterAroundMax(A, 22);
-        if (!p.ok) continue;
-        if (p.peak < FACE_MIN_SCORE) continue;
+    for (const auto& fm : faceModels) {
+        AccuImage A = makeAccu(img.w, img.h);
+        voter(A, img, out.dbgGrads, fm.lut, seuilFace);
 
-        if (!bestOk || p.peak > bestPeak.peak) {
-            bestOk = true;
-            bestPeak = p;
-            bestRx = faceModels[i].rx;
-            bestRy = faceModels[i].ry;
+        PicBary b = barycentreLocalAutourMax(A, 6);
+        if (b.ok && b.peak >= bestFacePeak) {
+            bestFacePeak = b.peak;
+            bestFaceX = (int)std::lround(b.bx);
+            bestFaceY = (int)std::lround(b.by);
+            bestRx = fm.rx;
+            bestRy = fm.ry;
+            bestAccu = A;
         }
     }
 
-    if (!bestOk) return out;
+    out.dbgFaceAccuOk = true;
+    out.dbgFaceAccu = bestAccu;
+
+    if (bestFacePeak < faceMinScore) {
+        out.faceOk = false;
+        return out;
+    }
 
     out.faceOk = true;
-    out.faceX = (int)std::lround(bestPeak.bx);
-    out.faceY = (int)std::lround(bestPeak.by);
-    out.faceScore = bestPeak.peak;
-    out.faceRx = bestRx;
-    out.faceRy = bestRy;
+    out.faceX = bestFaceX;
+    out.faceY = bestFaceY;
 
-    Roi eyeRoi;
-    eyeRoi.x0 = out.faceX - (int)std::lround((double)out.faceRx * 2.2);
-    eyeRoi.x1 = out.faceX + (int)std::lround((double)out.faceRx * 2.2);
-    eyeRoi.y0 = out.faceY - (int)std::lround((double)out.faceRy * 0.95);
-    eyeRoi.y1 = out.faceY - (int)std::lround((double)out.faceRy * 0.30);
-    eyeRoi = clampRoi(eyeRoi, gray.w, gray.h);
-    if (!roiValid(eyeRoi)) return out;
+    // EYES: define a search zone above face center (heuristic)
+    int zx0 = clampInt(bestFaceX - bestRx, 0, img.w - 1);
+    int zx1 = clampInt(bestFaceX + bestRx, 0, img.w - 1);
+    int zy0 = clampInt(bestFaceY - bestRy, 0, img.h - 1);
+    int zy1 = clampInt(bestFaceY, 0, img.h - 1);
 
-    bool pairOk = false;
-    uint32_t bestSum = 0;
-    PeakPoint bestL, bestR;
-    int bestRval = 0;
-
-    for (size_t i = 0; i < eyeModels.size(); ++i) {
-        AccuImage A = voteOffsets(grads, eyeModels[i].lut, EDGE_EYE, eyeRoi);
-
-        std::vector<PeakPoint> peaks = topKPeaksWithBary(A, 6, 14, 10, EYE_MIN_PEAK);
-
-        PeakPoint Lp, Rp;
-
-        int minDx = std::max(25, (int)std::lround((double)out.faceRx * 0.8));
-        int maxDx = std::min(gray.w, (int)std::lround((double)out.faceRx * 2.8));
-        int maxDy = std::max(12, (int)std::lround((double)out.faceRy * 0.18));
-
-        if (pickBestEyePair(peaks, out.faceX, out.faceY, minDx, maxDx, maxDy, Lp, Rp)) {
-            uint32_t sum = (uint32_t)Lp.v + (uint32_t)Rp.v;
-            if (!pairOk || sum > bestSum) {
-                pairOk = true;
-                bestSum = sum;
-                bestL = Lp;
-                bestR = Rp;
-                bestRval = eyeModels[i].r;
-            }
+    // Build sub-image zoneYeux
+    int zw = std::max(1, zx1 - zx0 + 1);
+    int zh = std::max(1, zy1 - zy0 + 1);
+    grayImage zoneYeux;
+    zoneYeux.w = zw;
+    zoneYeux.h = zh;
+    zoneYeux.p.assign((size_t)zw * (size_t)zh, 0);
+    for (int y = 0; y < zh; ++y) {
+        for (int x = 0; x < zw; ++x) {
+            zoneYeux.at(y, x) = img.at(zy0 + y, zx0 + x);
         }
     }
 
-    if (!pairOk) return out;
+    ChampGradient gradsYeux = sobel(zoneYeux);
+
+    // for each radius model, pick best peak, keep global best
+    uint16_t bestEyePeak = 0;
+    int bestR = 0;
+    AccuImage bestEyeAccu = makeAccu(zoneYeux.w, zoneYeux.h);
+    std::vector<PicPoint> bestPics;
+
+    for (const auto& em : eyeModels) {
+        AccuImage A = makeAccu(zoneYeux.w, zoneYeux.h);
+        voter(A, zoneYeux, gradsYeux, em.lut, seuilEye);
+
+        auto pics = topKpicsAvecBary(A, /*k*/6, /*nmsRadius*/em.r * 2, /*baryRadius*/6, /*minVal*/eyeMinPeak);
+        if (pics.empty()) continue;
+
+        // score by strongest peak of this radius
+        uint16_t localPeak = 0;
+        for (auto& p : pics) localPeak = std::max<uint16_t>(localPeak, p.v);
+
+        if (localPeak >= bestEyePeak) {
+            bestEyePeak = localPeak;
+            bestR = em.r;
+            bestEyeAccu = A;
+            bestPics = pics;
+        }
+    }
+
+    out.dbgEyeAccuOk = true;
+    out.dbgEyeAccu = bestEyeAccu;
+
+    if (bestPics.empty()) {
+        out.eyesOk = false;
+        return out;
+    }
+
+    // pair selection constraints based on face size
+    PicPoint og, od;
+    int minDx = std::max(10, (int)std::lround(bestRx * 0.6));
+    int maxDx = std::max(minDx + 10, (int)std::lround(bestRx * 1.6));
+    int maxDy = std::max(10, (int)std::lround(bestRy * 0.35));
+
+    bool pairOk = choisirPaireYeux(bestPics, bestFaceX - zx0, bestFaceY - zy0, minDx, maxDx, maxDy, og, od);
+    if (!pairOk) {
+        out.eyesOk = false;
+        return out;
+    }
 
     out.eyesOk = true;
-    out.ex1 = (int)std::lround(bestL.bx);
-    out.ey1 = (int)std::lround(bestL.by);
-    out.ex2 = (int)std::lround(bestR.bx);
-    out.ey2 = (int)std::lround(bestR.by);
-    out.eyeScoreSum = (uint16_t)clampi((int)bestSum, 0, 65535);
-    out.eyeR = bestRval;
+    out.eyeR = bestR;
+
+    // convert barycenters to global coords
+    out.ex1 = zx0 + (int)std::lround(og.bx);
+    out.ey1 = zy0 + (int)std::lround(og.by);
+    out.ex2 = zx0 + (int)std::lround(od.bx);
+    out.ey2 = zy0 + (int)std::lround(od.by);
 
     return out;
 }
 
 // MAIN
 int main(int argc, char** argv) {
-    bool doTest = false;
     bool doImage = false;
     std::string imagePath;
 
+    // In --image mode, default is headless (no GUI windows, no blocking waitKey).
+    // Use --gui to display debug windows and wait for a keypress.
+    bool imageGui = false;
+
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--test") doTest = true;
-        else if (a == "--image") {
+        if (a == "--image") {
             if (i + 1 < argc) { doImage = true; imagePath = argv[i + 1]; i++; }
+            continue;
+        }
+        if (a == "--gui") {
+            imageGui = true;
+            continue;
+        }
+        if (a == "--no-gui" || a == "--headless") {
+            imageGui = false;
+            continue;
         }
     }
 
@@ -549,8 +549,7 @@ int main(int argc, char** argv) {
     const uint16_t FACE_MIN_SCORE = 14;
     const uint16_t EYE_MIN_PEAK   = 5;
 
-    // Multi-échelle visage (ellipse)
-    std::vector<FaceModel> faceModels;
+    std::vector<facemodel> faceModels;
     {
         const int scales[][2] = {
             {25, 45}, {30, 55}, {35, 65}, {45, 85}, {55, 105}, {65, 125}, {75, 145}
@@ -562,10 +561,10 @@ int main(int argc, char** argv) {
             int tw = 2 * rx + 60;
             int th = 2 * ry + 60;
 
-            GrayImage t = makeEllipseTemplate(tw, th, (float)rx, (float)ry);
-            LUTOffsets lut = buildLUTOffsetsFromTemplate(t, 50, 220);
+            grayImage t = templateEllipse(tw, th, (float)rx, (float)ry);
+            RTable lut = construireRTableDepuisTemplate(t, 50, 220);
 
-            FaceModel fm;
+            facemodel fm;
             fm.rx = rx;
             fm.ry = ry;
             fm.lut = lut;
@@ -573,70 +572,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Multi-échelle yeux (cercle)
-    std::vector<EyeModel> eyeModels;
+    std::vector<eyemodel> eyeModels;
     {
         for (int r = 6; r <= 18; r += 2) {
             int tw = 2 * r + 40;
             int th = 2 * r + 40;
 
-            GrayImage t = makeCircleTemplate(tw, th, (float)r);
-            LUTOffsets lut = buildLUTOffsetsFromTemplate(t, 40, 220);
+            grayImage t = templateCercle(tw, th, (float)r);
+            RTable lut = construireRTableDepuisTemplate(t, 40, 220);
 
-            EyeModel em;
+            eyemodel em;
             em.r = r;
             em.lut = lut;
             eyeModels.push_back(em);
         }
-    }
-
-    // --test
-    if (doTest) {
-        std::cout << "[TEST] images artificielles + LUT + detection\n";
-
-        GrayImage imgE = makeArtificialEllipseImage(640, 480);
-        FaceEyes rE = detectFaceEyes(imgE, faceModels, eyeModels, EDGE_FACE, EDGE_EYE, FACE_MIN_SCORE, EYE_MIN_PEAK);
-        std::cout << "Expected ellipse center=(" << imgE.w/2 << "," << imgE.h/2 << ")\n";
-        if (rE.faceOk) {
-            std::cout << "Detected ellipse center=(" << rE.faceX << "," << rE.faceY
-                      << ") score=" << rE.faceScore
-                      << " scale=(" << rE.faceRx << "," << rE.faceRy << ")\n";
-        } else {
-            std::cout << "Detected ellipse: NOTFOUND\n";
-        }
-
-        GrayImage imgC = makeArtificialCircleImage(320, 320);
-        Gradients gC = sobelManual(imgC);
-        Roi fullC; fullC.x0=0; fullC.y0=0; fullC.x1=imgC.w; fullC.y1=imgC.h;
-
-        bool ok = false;
-        int bestX = -1, bestY = -1;
-        uint16_t bestSc = 0;
-        int bestR = 0;
-
-        for (size_t i = 0; i < eyeModels.size(); ++i) {
-            AccuImage A = voteOffsets(gC, eyeModels[i].lut, EDGE_EYE, fullC);
-            PeakBary p = localBarycenterAroundMax(A, 17);
-            if (!p.ok) continue;
-            if (!ok || p.peak > bestSc) {
-                ok = true;
-                bestSc = p.peak;
-                bestX = (int)std::lround(p.bx);
-                bestY = (int)std::lround(p.by);
-                bestR = eyeModels[i].r;
-            }
-        }
-
-        std::cout << "Expected circle center=(" << imgC.w/2 << "," << imgC.h/2 << ")\n";
-        if (ok) {
-            std::cout << "Detected circle center=(" << bestX << "," << bestY
-                      << ") score=" << bestSc << " r=" << bestR << "\n";
-        } else {
-            std::cout << "Detected circle: NOTFOUND\n";
-        }
-
-        std::cout << "[TEST] fini.\n";
-        return 0;
     }
 
     // --image
@@ -651,83 +600,95 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        GrayImage gray = bgrToGray(img);
-        FaceEyes r = detectFaceEyes(gray, faceModels, eyeModels, EDGE_FACE, EDGE_EYE, FACE_MIN_SCORE, EYE_MIN_PEAK);
+        grayImage gray = bgrToGray(img);
+        faceeyes r = detectfaceeyes(gray, faceModels, eyeModels, EDGE_FACE, EDGE_EYE, FACE_MIN_SCORE, EYE_MIN_PEAK);
 
-        if (r.faceOk) {
-            std::cout << "OK !\n";
-            std::cout << "Face=(" << r.faceX << "," << r.faceY << ") score=" << r.faceScore
-                      << " scale=(" << r.faceRx << "," << r.faceRy << ")\n";
-        } else {
-            std::cout << "Face=NOTFOUND\n";
+        if (imageGui) {
+            cv::imshow("Frame", img);
+            cv::imshow("Gray", toMatGray8(gray));
+            cv::imshow("Sobel", toMatMag8(r.dbgGrads));
+            if (r.dbgFaceAccuOk) cv::imshow("Accu Face (best scale)", toMatAccu8(r.dbgFaceAccu));
+            if (r.dbgEyeAccuOk)  cv::imshow("Accu Eyes (best radius)", toMatAccu8(r.dbgEyeAccu));
         }
-        if (r.eyesOk) {
-            std::cout << "Eyes=(" << r.ex1 << "," << r.ey1 << ") (" << r.ex2 << "," << r.ey2 << ") "
-                      << "eyeScoreSum=" << r.eyeScoreSum << " r=" << r.eyeR << "\n";
+
+        // IMPORTANT: stdout line for Python parser (GUI-independent)
+        if (!r.faceOk) {
+            std::cout << "Face=NOTFOUND\n";
         } else {
-            std::cout << "Eyes=NOTFOUND\n";
+            std::cout << "Face=(" << r.faceX << "," << r.faceY << ")";
+            if (!r.eyesOk) {
+                std::cout << " Eyes=NOTFOUND\n";
+            } else {
+                std::cout << " Eyes=(" << r.ex1 << "," << r.ey1 << ")"
+                        << " (" << r.ex2 << "," << r.ey2 << ")"
+                        << " r=" << r.eyeR << "\n";
+            }
+        }
+        std::cout.flush();
+
+        if (imageGui) {
+            std::cout << "Appuie sur une touche pour quitter.\n";
+            std::cout.flush();
+            cv::waitKey(0);
         }
         return 0;
     }
 
-    // Webcam
-    cv::VideoCapture cap(0);
-    if (!cap.isOpened()) {
+
+    // webcam
+    cv::VideoCapture camera(0);
+    if (!camera.isOpened()) {
         std::cerr << "Camera non ouverte.\n";
         return 1;
     }
 
     cv::Mat frame;
-    cap >> frame;
+    camera >> frame;
     if (frame.empty()) {
         std::cerr << "Impossible de lire une frame.\n";
         return 1;
     }
 
-    std::cout << "Resolution camera: " << frame.cols << "x" << frame.rows << "\n";
-    std::cout << "Detection en cours. Ctrl+C pour quitter.\n";
+    std::cout << "resolution camera : " << frame.cols << "x" << frame.rows << "\n";
+    std::cout << "detection en cours (ESC pour quitter).\n";
 
-    // OK ! au max une fois toutes les 5 secondes
     using Clock = std::chrono::steady_clock;
-    auto lastOkTime = Clock::now() - std::chrono::seconds(5);
-    const int OK_COOLDOWN_SEC = 5;
+    auto lastOk = Clock::now() - std::chrono::seconds(5);
+    const int cooldownOkSec = 5;
 
-    int frameCount = 0;
+    int framecount = 0;
+
     while (true) {
-        cap >> frame;
-        if (frame.empty()) continue;
-        if (frame.channels() != 3) continue;
+        camera >> frame;
+        if (frame.empty()) break;
 
-        GrayImage gray = bgrToGray(frame);
-        FaceEyes r = detectFaceEyes(gray, faceModels, eyeModels, EDGE_FACE, EDGE_EYE, FACE_MIN_SCORE, EYE_MIN_PEAK);
+        grayImage gray = bgrToGray(frame);
+        faceeyes r = detectfaceeyes(gray, faceModels, eyeModels, EDGE_FACE, EDGE_EYE, FACE_MIN_SCORE, EYE_MIN_PEAK);
 
-        // Affiche OK ! au maximum une fois par tranche de 5 secondes
-        auto now = Clock::now();
+        // Example minimal live debug (optional)
+        cv::imshow("Frame", frame);
+
+        // Print detections (optional; useful for debugging)
         if (r.faceOk) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastOkTime).count();
-            if (elapsed >= OK_COOLDOWN_SEC) {
-                std::cout << "OK !\n";
-                lastOkTime = now;
-            }
-        }
-
-        if (frameCount % 30 == 0) {
-            if (r.faceOk) {
-                std::cout << "Face=(" << r.faceX << "," << r.faceY << ") score=" << r.faceScore
-                          << " scale=(" << r.faceRx << "," << r.faceRy << ")";
-                if (r.eyesOk) {
-                    std::cout << " Eyes=(" << r.ex1 << "," << r.ey1 << ") (" << r.ex2 << "," << r.ey2 << ") "
-                              << "eyeScoreSum=" << r.eyeScoreSum << " r=" << r.eyeR;
-                } else {
-                    std::cout << " Eyes=NOTFOUND";
-                }
-                std::cout << "\n";
+            std::cout << "Face = (" << r.faceX << "," << r.faceY << ")";
+            if (r.eyesOk) {
+                std::cout << " Eyes = (" << r.ex1 << "," << r.ey1 << ")"
+                          << " (" << r.ex2 << "," << r.ey2 << ")"
+                          << " r = " << r.eyeR;
             } else {
-                std::cout << "Face=NOTFOUND\n";
+                std::cout << " Eyes = NOTFOUND";
             }
+            std::cout << "\n";
+        } else {
+            std::cout << "Face = NOTFOUND\n";
         }
 
-        frameCount++;
+        int k = cv::waitKey(1);
+        if (k == 27) break; // ESC
+
+        framecount++;
+        (void)lastOk;
+        (void)cooldownOkSec;
     }
 
     return 0;
