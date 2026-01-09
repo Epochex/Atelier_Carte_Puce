@@ -38,13 +38,26 @@ def detect_face_eyes_by_ght(
     bin_path: Optional[str] = None,
     timeout_sec: int = 5,
     headless: bool = True,
+    gui: bool = False,
+    gui_steps: bool = False,
+    gui_delay_ms: int = 0,
+    # New knobs (optional)
+    auto_threshold: bool = True,
+    face_edge: Optional[int] = None,
+    eye_edge: Optional[int] = None,
+    face_min_score: Optional[int] = None,
+    eye_min_peak: Optional[int] = None,
+    eq_hist: bool = True,
+    clahe: bool = False,
+    blur_k: int = 5,
 ) -> FaceEyesDet:
     """
     Call C++ GHT detector and parse stdout for Face/Eyes.
 
-      ght_face_eyes --image <path> [--no-gui]
-
-    Headless mode avoids GUI windows + waitKey(0) blocking in automation.
+      ght_face_eyes --image <path> [--gui] [--no-gui] [--gui-steps] [--gui-delay-ms <N>]
+                   [--no-auto-threshold] [--face-edge v] [--eye-edge v]
+                   [--no-eq] [--clahe] [--blur k]
+                   [--face-min-score v] [--eye-min-peak v]
     """
     if not image_path or not os.path.exists(image_path):
         return FaceEyesDet(face_ok=False, eyes_ok=False, raw="image_not_found")
@@ -54,9 +67,36 @@ def detect_face_eyes_by_ght(
         return FaceEyesDet(face_ok=False, eyes_ok=False, raw=f"vision_binary_not_found:{exe}")
 
     cmd: List[str] = [exe, "--image", image_path]
-    if headless:
-        # supported by your patched C++ (also accepts --headless)
+
+    # GUI/headless controls
+    if gui or gui_steps or (gui_delay_ms and gui_delay_ms > 0):
+        cmd.append("--gui")
+        if gui_steps:
+            cmd.append("--gui-steps")
+        if gui_delay_ms and gui_delay_ms > 0:
+            cmd.extend(["--gui-delay-ms", str(int(gui_delay_ms))])
+    elif headless:
         cmd.append("--no-gui")
+
+    # preprocessing flags
+    if not auto_threshold:
+        cmd.append("--no-auto-threshold")
+    if not eq_hist:
+        cmd.append("--no-eq")
+    if clahe:
+        cmd.append("--clahe")
+    if blur_k is not None:
+        cmd.extend(["--blur", str(int(blur_k))])
+
+    # thresholds
+    if face_edge is not None:
+        cmd.extend(["--face-edge", str(int(face_edge))])
+    if eye_edge is not None:
+        cmd.extend(["--eye-edge", str(int(eye_edge))])
+    if face_min_score is not None:
+        cmd.extend(["--face-min-score", str(int(face_min_score))])
+    if eye_min_peak is not None:
+        cmd.extend(["--eye-min-peak", str(int(eye_min_peak))])
 
     try:
         cp = subprocess.run(

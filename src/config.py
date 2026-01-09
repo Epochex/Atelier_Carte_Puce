@@ -14,7 +14,7 @@ class CameraConfig:
 
 @dataclass
 class BiometricConfig:
-    score_threshold: float = 0.18
+    score_threshold: float = 0.5
     use_face_crop: bool = True
     orb_nfeatures: int = 800
 
