@@ -23,9 +23,13 @@ EXCLUDE_DIRS = {
 EXCLUDE_FILES = {"code.txt"}
 EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".pyd", ".so", ".dll", ".dylib"}
 
+INCLUDE_SUFFIXES = {".py", ".c", ".cpp", ".h", ".hpp", ".sh"}
+
 
 def should_skip(path: Path) -> bool:
     rel = path.relative_to(root)
+
+    # Skip any path that contains an excluded directory in its components
     if set(rel.parts) & EXCLUDE_DIRS:
         return True
 
@@ -50,24 +54,33 @@ def print_tree(out, root_path: Path) -> None:
         depth = len(rel.parts) - 1
         indent = "  " * depth
 
-        if path.is_dir():
-            out.write(f"{indent}├── {path.name}/\n")
-        else:
-            out.write(f"{indent}├── {path.name}\n")
+        suffix = "/" if path.is_dir() else ""
+        out.write(f"{indent}├── {path.name}{suffix}\n")
 
     out.write("\n\n")
+
+
+def iter_source_files(root_path: Path):
+    for p in sorted(root_path.rglob("*")):
+        if not p.is_file():
+            continue
+        if should_skip(p):
+            continue
+        # include selected suffixes; also include files with no suffix but executable scripts if needed
+        if p.suffix.lower() in INCLUDE_SUFFIXES:
+            yield p
 
 
 with output.open("w", encoding="utf-8") as out:
     print_tree(out, root)
 
-    py_files = sorted(p for p in root.rglob("*.py") if p.is_file() and not should_skip(p))
-    for p in py_files:
-        out.write(f"FILE: {p.relative_to(root)}\n\n")
+    for p in iter_source_files(root):
+        out.write(f"FILE: {p.relative_to(root)}\n")
+        out.write("=" * 80 + "\n")
         try:
             out.write(p.read_text(encoding="utf-8"))
         except UnicodeDecodeError:
             out.write(p.read_text(encoding="latin-1", errors="replace"))
         out.write("\n\n")
 
-print("Filtered directory tree + Python code saved to code.txt")
+print(f"Filtered directory tree + source files saved to {output}")

@@ -49,7 +49,7 @@ def main():
     print(f"[card] write_app_record={wrote}")
 
     upsert_user(conn, args.user_id, card_uid, salt, ph, card_atr=s.atr_hex)
-    upsert_biometric(conn, args.user_id, template_path, tpl_sha, algo="ORB+facecrop")
+    upsert_biometric(conn, args.user_id, template_path, tpl_sha, algo="GHT+iris_hist")
 
     print(f"ENROLL OK: user_id={args.user_id}, template={template_path}")
 

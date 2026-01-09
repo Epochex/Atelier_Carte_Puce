@@ -15,7 +15,7 @@ biometric:
   orb_nfeatures: 800
 
 auth:
-  required_factors: 2
+  required_factors: 3
   max_pin_attempts: 3
   lockout_seconds: 20
   # Enforce mandatory binding validation between “Card ↔ User ↔ Template”
