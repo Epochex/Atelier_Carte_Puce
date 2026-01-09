@@ -39,3 +39,32 @@ data/demo_videos/
 config.local.yaml
 config.local.yml
 
+
+
+# ---- C / C++ build artifacts ----
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+*.bin
+
+# ---- CMake ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# ---- CMake build directories ----
+build/
+**/build/
+
+# ---- generated / local artifacts ----
+code.txt
+
+# ---- vision binaries (do NOT commit) ----
+vision/bin/
